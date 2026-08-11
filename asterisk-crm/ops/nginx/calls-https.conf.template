@@ -1,0 +1,108 @@
+# Dedicated MO54 Calls virtual host for __DOMAIN__.
+# It is intentionally a new nginx site: do not merge it into, replace, or
+# edit the virtual host of the existing /opt/mo54 application.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __DOMAIN__;
+
+    server_tokens off;
+
+    # Keep ACME renewal independent from application availability.
+    location ^~ /.well-known/acme-challenge/ {
+        # certbot --webroot writes
+        # __ACME_WEBROOT__/.well-known/acme-challenge/<token>.
+        root __ACME_WEBROOT__;
+        default_type "text/plain";
+        try_files $uri =404;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name __DOMAIN__;
+
+    ssl_certificate     /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:MO54CallsSSL:10m;
+    ssl_session_tickets off;
+
+    server_tokens off;
+    client_max_body_size 2m;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), geolocation=(), microphone=()" always;
+    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; media-src 'self'; object-src 'none'; style-src 'self'; script-src 'self'" always;
+
+    # Health is intentionally reachable through the public HTTPS host so that
+    # deployment monitoring can verify the new application without exposing
+    # the loopback API port itself.
+    location = /health {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # A second limit exists in the API itself.  This outer limit reduces the
+    # cost of password guessing before a request reaches the container.
+    location = /api/auth/token {
+        limit_req zone=mo54_calls_login burst=5 nodelay;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Novofon delivers server-to-server notifications only from this address.
+    # The application must also compare the high-entropy path secret and the
+    # integration_key in the JSON body.  Do not broaden this allowlist.
+    location ^~ /api/integrations/novofon/ {
+        allow 37.139.38.215;
+        deny all;
+
+        # The path itself is one authentication secret. Never write it to the
+        # nginx access log; application/worker logs use event IDs instead.
+        access_log off;
+
+        client_max_body_size 256k;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 15s;
+        proxy_read_timeout 15s;
+    }
+
+    # The Docker API remains bound to 127.0.0.1.  This is the only public path
+    # to MO54 Calls and is independent from the existing MO54 nginx site.
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+}

@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">MO54 Calls</string>
+    <string name="channel_calls">Звонки и запись</string>
+    <string name="channel_outcomes">Итоги звонков</string>
+    <string name="channel_sync">Синхронизация</string>
+</resources>
+

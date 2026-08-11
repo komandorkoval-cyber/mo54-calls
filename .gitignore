@@ -1,0 +1,62 @@
+.gradle/
+.idea/
+.vscode/
+local.properties
+**/build/
+*.iml
+*.apk
+*.aab
+diagnostics/artifacts/
+android/signing.properties
+android/*.jks
+
+# Local environments and integration credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.*.example
+**/.api.secrets.env
+!**/.api.secrets.env.example
+**/.worker.secrets.env
+!**/.worker.secrets.env.example
+
+# Runtime data and production exports
+**/private/
+**/queue/
+**/recordings/
+**/backups/
+backups/
+*.dump
+*.pem
+*.key
+*.log
+*.pcap
+*.pcapng
+*.pcap.zip
+*.pcapng.zip
+*.pcap*.zip
+novofon-*-pcap.zip
+audit_dump.txt
+
+# Generated and vendor-heavy local tools
+**/__pycache__/
+**/*.pyc
+tools/xiaomi-unlock/
+magisk/**/*.apk
+novofon-*.pcap*
+
+# Potentially sensitive local diagnostics and generated PBX runtime configuration
+diagnostics/artifacts/
+asterisk-crm/asterisk/etc/asterisk/pjsip.conf
+
+# Historical handover may contain retired credentials; preserve locally only
+asterisk-crm-developer-handover.md
+
+# Superseded notes may mention retired configuration; the canonical set is docs/
+GUIDE.md
+SECURITY.md
+STATUS-2026-06-29.md

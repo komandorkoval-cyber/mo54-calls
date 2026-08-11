@@ -1,0 +1,12 @@
+[Unit]
+Description=Restrict Docker SIP/RTP ports to Novofon and the WireGuard softphone
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/asterisk-crm/ops/docker-sip-firewall.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

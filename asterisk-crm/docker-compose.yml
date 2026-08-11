@@ -1,0 +1,186 @@
+services:
+  asterisk:
+    build: ./asterisk
+    restart: unless-stopped
+    networks:
+      - telephony-net
+    volumes:
+      - ./asterisk/etc/asterisk:/etc/asterisk
+      - ./asterisk/scripts:/scripts:ro
+      - recordings:/recordings
+      - queue:/queue
+      - asterisk-logs:/var/log/asterisk
+    ports:
+      - "${ASTERISK_BIND_IP:-127.0.0.1}:5060:5060/udp"
+      - "${ASTERISK_BIND_IP:-127.0.0.1}:5060:5060/tcp"
+      - "${ASTERISK_BIND_IP:-127.0.0.1}:10000-10200:10000-10200/udp"
+    # Do not inherit the general .env.  Asterisk needs only its SIP template
+    # inputs and must never receive CRM, LLM, Novofon webhook, or Call API
+    # credentials.
+    environment:
+      ASTERISK_PUBLIC_IP: ${ASTERISK_PUBLIC_IP}
+      SIP_SERVER: ${SIP_SERVER}
+      SIP_SERVER_IP: ${SIP_SERVER_IP}
+      IGOR_EXT_PASSWORD: ${IGOR_EXT_PASSWORD}
+      QUEUE_DIR: /queue
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - SYS_NICE
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+
+  worker:
+    build: ./worker
+    restart: unless-stopped
+    networks:
+      - telephony-net
+    volumes:
+      - recordings:/recordings:ro
+      - queue:/queue
+      - model-cache:/root/.cache/onnx_asr
+    # Data API access is the worker's only Novofon secret.  Its optional
+    # private file intentionally contains no webhook or Call API credential.
+    env_file:
+      - path: .worker.secrets.env
+        required: false
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      QUEUE_DIR: /queue
+      POLL_INTERVAL: ${POLL_INTERVAL:-5}
+      PROVIDER_EVENT_LEASE_MINUTES: ${PROVIDER_EVENT_LEASE_MINUTES:-15}
+      LLM_PROVIDER: ${LLM_PROVIDER:-gigachat}
+      GIGACHAT_AUTH_KEY: ${GIGACHAT_AUTH_KEY:-}
+      GIGACHAT_MODEL: ${GIGACHAT_MODEL:-GigaChat}
+      GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+      GIGACHAT_CA_BUNDLE: ${GIGACHAT_CA_BUNDLE:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:1b}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+      NOVOFON_DATA_API_URL: ${NOVOFON_DATA_API_URL:-https://dataapi-jsonrpc.novofon.ru/v2.0}
+      NOVOFON_VIRTUAL_NUMBER: ${NOVOFON_VIRTUAL_NUMBER:-}
+      NOVOFON_RECONCILE_ENABLED: ${NOVOFON_RECONCILE_ENABLED:-false}
+      NOVOFON_RECONCILE_INTERVAL_SECONDS: ${NOVOFON_RECONCILE_INTERVAL_SECONDS:-3600}
+      NOVOFON_RECONCILE_WINDOW_HOURS: ${NOVOFON_RECONCILE_WINDOW_HOURS:-24}
+      NOVOFON_RECONCILE_OVERLAP_MINUTES: ${NOVOFON_RECONCILE_OVERLAP_MINUTES:-10}
+      NOVOFON_RECONCILE_PAGE_SIZE: ${NOVOFON_RECONCILE_PAGE_SIZE:-100}
+      NOVOFON_RECONCILE_MAX_PAGES: ${NOVOFON_RECONCILE_MAX_PAGES:-50}
+      NOVOFON_ACCOUNT_TIMEZONE: ${NOVOFON_ACCOUNT_TIMEZONE:-Europe/Moscow}
+      NOVOFON_TRANSCRIPT_ENABLED: ${NOVOFON_TRANSCRIPT_ENABLED:-false}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  api:
+    build: ./api
+    restart: unless-stopped
+    networks:
+      - telephony-net
+    volumes:
+      - recordings:/recordings:ro
+    # .api.secrets.env is API-only and ignored by Git.  It supplies the
+    # callback token and both webhook secrets directly to this container; no
+    # other service receives that file.  `required: false` keeps a local CRM
+    # usable before Novofon integration is configured.
+    env_file:
+      - path: .api.secrets.env
+        required: false
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      CRM_ADMIN_EMAIL: ${CRM_ADMIN_EMAIL}
+      CRM_ADMIN_PASSWORD: ${CRM_ADMIN_PASSWORD}
+      # Browser authentication is an opaque, server-side session. Do not
+      # reintroduce a JWT secret or a client-readable bearer token here.
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
+      INGEST_TOKEN: ${INGEST_TOKEN}
+      RECORDINGS_DIR: /recordings
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-}
+      SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-crm_session}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      SESSION_COOKIE_SAMESITE: ${SESSION_COOKIE_SAMESITE:-strict}
+      CRM_LOGIN_MAX_ATTEMPTS: ${CRM_LOGIN_MAX_ATTEMPTS:-5}
+      CRM_LOGIN_WINDOW_SECONDS: ${CRM_LOGIN_WINDOW_SECONDS:-900}
+      NOVOFON_CALL_API_URL: ${NOVOFON_CALL_API_URL:-https://callapi-jsonrpc.novofon.ru/v4.0}
+      NOVOFON_VIRTUAL_NUMBER: ${NOVOFON_VIRTUAL_NUMBER:-}
+      NOVOFON_ACCOUNT_TIMEZONE: ${NOVOFON_ACCOUNT_TIMEZONE:-Europe/Moscow}
+      NOVOFON_WEBHOOK_ALLOWED_IPS: ${NOVOFON_WEBHOOK_ALLOWED_IPS:-37.139.38.215}
+      NOVOFON_RECORDING_ALLOWED_HOSTS: ${NOVOFON_RECORDING_ALLOWED_HOSTS:-novofon.ru}
+    ports:
+      - "127.0.0.1:${CRM_HTTP_PORT:-8080}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks:
+      - telephony-net
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  migrate:
+    image: postgres:16-alpine
+    restart: "no"
+    networks:
+      - telephony-net
+    volumes:
+      - ./sql:/migrations:ro
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        for migration in /migrations/*.sql; do
+          echo "Applying $$migration"
+          PGPASSWORD="$$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 \
+            -h postgres -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -f "$$migration"
+        done
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    networks:
+      - telephony-net
+    volumes:
+      - ollama-models:/root/.ollama
+    profiles:
+      - local-llm
+
+networks:
+  telephony-net:
+    driver: bridge
+
+volumes:
+  recordings:
+  queue:
+  asterisk-logs:
+  pgdata:
+  model-cache:
+  ollama-models:

@@ -1,0 +1,264 @@
+openapi: 3.1.0
+info:
+  title: MO54 Call Companion API
+  version: 1.0.0
+servers:
+  - url: https://mo54.example/api/call-companion
+security:
+  - deviceToken: []
+paths:
+  /device-link:
+    post:
+      security: []
+      operationId: deviceLink
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DeviceLinkRequest'}
+      responses:
+        '200':
+          description: Device linked
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DeviceLinkResponse'}
+        '400': {$ref: '#/components/responses/Error'}
+  /config:
+    get:
+      operationId: getConfig
+      responses:
+        '200':
+          description: Companion configuration
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Config'}
+        '401': {$ref: '#/components/responses/Error'}
+  /calls:
+    post:
+      operationId: upsertCall
+      description: Idempotent by deviceId and localCallId. Only confirmed work calls are accepted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Call'}
+      responses:
+        '200':
+          description: Accepted or updated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [callId, localCallId, syncStatus, updatedAt]
+                properties:
+                  callId: {type: string, format: uuid}
+                  localCallId: {type: string, format: uuid}
+                  syncStatus: {const: accepted}
+                  updatedAt: {type: string, format: date-time}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Error'}
+    get:
+      operationId: listCalls
+      parameters:
+        - {name: workerId, in: query, required: true, schema: {type: string}}
+        - {name: status, in: query, required: false, schema: {type: string}}
+      responses:
+        '200':
+          description: Calls page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: {type: array, items: {$ref: '#/components/schemas/CallListItem'}}
+  /calls/{callId}/audio:
+    post:
+      operationId: uploadAudio
+      parameters:
+        - {$ref: '#/components/parameters/CallId'}
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [localCallId, audioSha256, recordingStatus, mimeType, durationSec, file]
+              properties:
+                localCallId: {type: string, format: uuid}
+                audioSha256: {type: string, pattern: '^[a-fA-F0-9]{64}$'}
+                recordingStatus: {const: recorded}
+                mimeType: {type: string}
+                durationSec: {type: integer, minimum: 0}
+                file: {type: string, format: binary}
+      responses:
+        '200':
+          description: Audio accepted or already exists
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AudioResponse'}
+        '400': {$ref: '#/components/responses/Error'}
+        '413': {$ref: '#/components/responses/Error'}
+  /calls/{callId}/outcome:
+    patch:
+      operationId: saveOutcome
+      parameters:
+        - {$ref: '#/components/parameters/CallId'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Outcome'}
+      responses:
+        '200':
+          description: Outcome and follow-up idempotently saved
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [callId, outcomeSaved, updatedAt]
+                properties:
+                  callId: {type: string, format: uuid}
+                  outcomeSaved: {type: boolean}
+                  followupTaskId: {type: [string, 'null']}
+                  updatedAt: {type: string, format: date-time}
+        '400': {$ref: '#/components/responses/Error'}
+  /diagnostics:
+    post:
+      operationId: saveDiagnostics
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Diagnostics'}
+      responses:
+        '200':
+          description: Saved
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [diagnosticId, saved]
+                properties:
+                  diagnosticId: {type: string, format: uuid}
+                  saved: {const: true}
+components:
+  securitySchemes:
+    deviceToken: {type: http, scheme: bearer}
+  parameters:
+    CallId: {name: callId, in: path, required: true, schema: {type: string, format: uuid}}
+  responses:
+    Error:
+      description: Request failed
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+  schemas:
+    DeviceLinkRequest:
+      type: object
+      required: [pairingCode, deviceName, androidVersion, manufacturer, model, appVersion]
+      properties:
+        pairingCode: {type: string, minLength: 1}
+        deviceName: {type: string}
+        androidVersion: {type: string}
+        manufacturer: {type: string}
+        model: {type: string}
+        appVersion: {type: string}
+    DeviceLinkResponse:
+      type: object
+      required: [deviceId, workerId, deviceToken]
+      properties:
+        deviceId: {type: string}
+        workerId: {const: worker-igor}
+        workerName: {type: [string, 'null']}
+        deviceToken: {type: string}
+        expiresAt: {type: [string, 'null'], format: date-time}
+    Config:
+      type: object
+      required: [workerId, requiredOutcomeForWorkCalls, recordingNoticeText, maxAudioSizeMb, allowedAudioMimeTypes, nextActionTypes]
+      properties:
+        workerId: {const: worker-igor}
+        requiredOutcomeForWorkCalls: {const: true}
+        recordingNoticeText: {type: string}
+        maxAudioSizeMb: {type: integer, minimum: 1}
+        allowedAudioMimeTypes: {type: array, items: {type: string}}
+        nextActionTypes: {type: array, items: {$ref: '#/components/schemas/NextActionType'}}
+    Call:
+      type: object
+      required: [localCallId, deviceId, workerId, direction, phoneRaw, startedAt, endedAt, durationSec, recordingStatus, noticeStatus, source, eventSource, deviceSnapshot]
+      properties:
+        localCallId: {type: string, format: uuid}
+        deviceId: {type: string}
+        workerId: {const: worker-igor}
+        direction: {enum: [incoming, outgoing, unknown]}
+        phoneRaw: {type: string}
+        phoneNormalized: {type: [string, 'null']}
+        startedAt: {type: string, format: date-time}
+        endedAt: {type: string, format: date-time}
+        durationSec: {type: integer, minimum: 0}
+        recordingStatus: {$ref: '#/components/schemas/RecordingStatus'}
+        noticeStatus: {$ref: '#/components/schemas/NoticeStatus'}
+        source: {const: android-companion}
+        eventSource: {enum: [live, recovered_from_call_log]}
+        deviceSnapshot: {$ref: '#/components/schemas/DeviceSnapshot'}
+    DeviceSnapshot:
+      type: object
+      required: [androidVersion, manufacturer, model, appVersion]
+      properties:
+        androidVersion: {type: string}
+        manufacturer: {type: string}
+        model: {type: string}
+        appVersion: {type: string}
+    Outcome:
+      type: object
+      required: [outcomeStatus, noticeConfirmedByWorker]
+      properties:
+        outcomeStatus: {$ref: '#/components/schemas/OutcomeStatus'}
+        summary: {type: [string, 'null']}
+        objection: {type: [string, 'null']}
+        nextActionType: {oneOf: [{$ref: '#/components/schemas/NextActionType'}, {type: 'null'}]}
+        nextActionAt: {type: [string, 'null'], format: date-time}
+        nextActionComment: {type: [string, 'null']}
+        noticeConfirmedByWorker: {type: boolean}
+    Diagnostics:
+      type: object
+      additionalProperties: true
+      required: [deviceId, workerId, androidVersion, manufacturer, model, appVersion, conclusion]
+      properties:
+        deviceId: {type: string}
+        workerId: {const: worker-igor}
+        androidVersion: {type: string}
+        manufacturer: {type: string}
+        model: {type: string}
+        appVersion: {type: string}
+        conclusion: {enum: [pass, partial, fail, blocked_by_os, needs_device_change]}
+        notes: {type: string}
+    AudioResponse:
+      type: object
+      required: [audioAssetId, callId, recordingStatus, receivedSha256, sizeBytes, createdAt]
+      properties:
+        audioAssetId: {type: string}
+        callId: {type: string}
+        recordingStatus: {const: recorded}
+        receivedSha256: {type: string}
+        sizeBytes: {type: integer}
+        createdAt: {type: string, format: date-time}
+    CallListItem:
+      type: object
+      additionalProperties: true
+    Error:
+      type: object
+      required: [error, message, retryable]
+      properties:
+        error: {type: string}
+        message: {type: string}
+        retryable: {type: boolean}
+    RecordingStatus:
+      enum: [not_attempted, recording, recorded, unsupported, permission_denied, failed]
+    NoticeStatus:
+      enum: [not_attempted, played_to_call, played_locally_only, unsupported, failed, confirmed_manually]
+    OutcomeStatus:
+      enum: [new_lead, continue_work, proposal_needed, measurement_needed, prepayment_or_contract, no_answer, lost, no_action_required]
+    NextActionType:
+      enum: [call, message, prepare_proposal, schedule_measurement, send_contract, check_payment, other]
+

@@ -1,0 +1,2 @@
+-- Password is set by the API on first boot from CRM_ADMIN_PASSWORD.
+-- This migration intentionally contains no default credentials.

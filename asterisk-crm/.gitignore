@@ -1,0 +1,20 @@
+.env
+!.env.example
+.api.secrets.env
+!.api.secrets.env.example
+.worker.secrets.env
+!.worker.secrets.env.example
+
+# Генерируется из pjsip.conf.tpl при старте контейнера
+asterisk/etc/asterisk/pjsip.conf
+
+# Данные runtime
+queue/
+recordings/
+backups/
+private/
+*.dump
+*.pem
+*.key
+__pycache__/
+*.pyc

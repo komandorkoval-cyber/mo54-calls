@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MO54 Calls</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <section id="login" class="login">
+    <form id="login-form" class="login-card">
+      <div class="brand-mark">M54</div>
+      <h1>Разговоры, которые<br>двигают продажи</h1>
+      <p>Войдите в рабочее пространство MO54 Calls</p>
+      <label>Электронная почта<input name="username" type="email" autocomplete="username" required></label>
+      <label>Пароль<input name="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit">Войти</button>
+      <div id="login-error" class="error"></div>
+    </form>
+  </section>
+
+  <section id="password-change" class="login hidden" aria-labelledby="password-change-title">
+    <form id="password-change-form" class="login-card password-card">
+      <div class="brand-mark">M54</div>
+      <h1 id="password-change-title">Смените стартовый пароль</h1>
+      <p>Это обязательный шаг перед началом работы с карточками клиентов и записями разговоров.</p>
+      <label>Текущий пароль<input name="current_password" type="password" autocomplete="current-password" required></label>
+      <label>Новый пароль<input name="new_password" type="password" autocomplete="new-password" minlength="16" required></label>
+      <label>Повторите новый пароль<input name="new_password_confirm" type="password" autocomplete="new-password" minlength="16" required></label>
+      <button type="submit">Сохранить новый пароль</button>
+      <div id="password-change-error" class="error" role="alert"></div>
+    </form>
+  </section>
+
+  <div id="workspace" class="workspace hidden">
+    <aside>
+      <div class="logo"><span>M54</span><div>CALLS</div></div>
+      <nav>
+        <button data-view="dashboard" class="active"><i>◫</i>Обзор</button>
+        <button data-view="calls"><i>◉</i>Звонки</button>
+        <button data-view="contacts"><i>♙</i>Клиенты</button>
+        <button data-view="tasks"><i>✓</i>Задачи</button>
+        <button data-view="pipeline"><i>⌁</i>Воронка</button>
+        <button data-view="admin" id="admin-link"><i>⚙</i>Обработка</button>
+      </nav>
+      <div class="aside-foot">
+        <div class="status-dot">Система работает</div>
+        <button id="logout">Выйти</button>
+      </div>
+    </aside>
+
+    <main>
+      <header>
+        <div><div class="eyebrow" id="eyebrow">РАБОЧЕЕ ПРОСТРАНСТВО</div><h1 id="title">Обзор</h1></div>
+        <div class="user-chip"><span id="avatar">И</span><div><b id="user-name">Игорь</b><small id="user-role">Менеджер</small></div></div>
+      </header>
+      <div id="content"></div>
+    </main>
+  </div>
+  <div id="toast"></div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

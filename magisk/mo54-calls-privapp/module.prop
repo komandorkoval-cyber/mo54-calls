@@ -1,0 +1,6 @@
+id=mo54-calls-privapp
+name=MO54 Calls Privileged Recorder
+version=0.1.0-spike
+versionCode=1
+author=MO54
+description=Installs MO54 Calls as a privileged app and allowlists call-audio permissions for automatic VOICE_CALL recording on Android 10/MIUI.

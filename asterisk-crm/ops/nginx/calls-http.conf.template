@@ -1,0 +1,23 @@
+# Bootstrap-only virtual host for __DOMAIN__.
+# It serves ACME challenges before the certificate exists and intentionally
+# does not publish the CRM over plain HTTP.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __DOMAIN__;
+
+    server_tokens off;
+
+    location ^~ /.well-known/acme-challenge/ {
+        # certbot --webroot writes
+        # __ACME_WEBROOT__/.well-known/acme-challenge/<token>.
+        root __ACME_WEBROOT__;
+        default_type "text/plain";
+        try_files $uri =404;
+    }
+
+    # Until a certificate has been issued, no CRM page is available over HTTP.
+    location / {
+        return 404;
+    }
+}
