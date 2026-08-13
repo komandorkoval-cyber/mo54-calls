@@ -56,6 +56,11 @@ def normalize_employee_id(value: Any) -> int | None:
 
 
 def event_type(payload: dict[str, Any]) -> str:
+    # Novofon recording notifications can contain only the recording link,
+    # without an explicit event/type field. Treat that shape as RECORD_CALL
+    # so the API ledger and worker follow the same idempotent path.
+    if recording_url(payload):
+        return "RECORD_CALL"
     raw = str(payload.get("event") or payload.get("event_type") or "").upper().strip()
     aliases = {
         "CALL_END": "CALL_END",

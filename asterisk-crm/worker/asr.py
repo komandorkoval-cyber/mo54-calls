@@ -43,4 +43,3 @@ def build_transcript(customer_path: str | None, manager_path: str | None) -> tup
         segments.append({"speaker": "manager", "text": manager})
         lines.append(f"[Менеджер]: {manager}")
     return "\n".join(lines), segments
-

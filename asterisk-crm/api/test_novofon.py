@@ -42,6 +42,10 @@ class NovofonHelperTests(unittest.TestCase):
         payload["call_record_file_info"]["file_link"] = "http://files.novofon.ru/r/abc"
         self.assertIsNone(recording_url(payload))
 
+    def test_recording_notification_without_explicit_type_is_record_call(self):
+        payload = {"call_session_id": "session-42", "file_link": "https://files.novofon.ru/r/abc"}
+        self.assertEqual(event_type(payload), "RECORD_CALL")
+
     def test_employee_id_is_a_positive_json_number(self):
         self.assertEqual(normalize_employee_id("100"), 100)
         self.assertEqual(normalize_employee_id(42), 42)

@@ -138,6 +138,24 @@ def normalize_direction(value: object) -> str:
 
 
 def canonical_event_type(payload: Mapping[str, Any]) -> str:
+    # Novofon's configurable recording notification can arrive without an
+    # explicit event/type field.  A signed HTTPS file link is itself the
+    # authoritative indication that this is a recording-ready event; treating
+    # it as UNKNOWN would leave a valid provider recording unavailable in CRM.
+    record_info = _as_dict(
+        payload.get("call_record_file_info")
+        or payload.get("record_file_info")
+        or payload.get("recording_info")
+    )
+    if _first(
+        record_info.get("file_link"),
+        record_info.get("file_url"),
+        record_info.get("recording_url"),
+        payload.get("file_link"),
+        payload.get("file_url"),
+        payload.get("recording_url"),
+    ):
+        return "RECORD_CALL"
     raw = _first(
         payload.get("event"),
         payload.get("event_type"),

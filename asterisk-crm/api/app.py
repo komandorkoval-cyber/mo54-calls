@@ -530,7 +530,7 @@ def safe_provider_recording_url(url: str | None) -> str | None:
         return None
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or not host:
+    if parsed.scheme != "https" or not host or parsed.username or parsed.password:
         return None
     for allowed in NOVOFON_RECORDING_ALLOWED_HOSTS:
         normalized = allowed.lstrip(".")
@@ -920,7 +920,10 @@ def recording(recording_id: UUID, user: User = Depends(current_user)):
     target = Path(row["storage_path"]).resolve()
     if RECORDINGS_DIR not in target.parents or not target.is_file():
         raise HTTPException(404, "Файл записи недоступен")
-    return FileResponse(target, media_type=row["mime_type"], filename=target.name)
+    response = FileResponse(target, media_type=row["mime_type"], filename=target.name)
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 @app.get("/api/contacts")
