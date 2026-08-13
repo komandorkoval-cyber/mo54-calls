@@ -30,6 +30,7 @@ from novofon import (
     call_session_id,
     event_idempotency_key,
     event_type,
+    interactive_call_route,
     link_hash,
     normalize_employee_id,
     nested,
@@ -73,6 +74,12 @@ NOVOFON_WEBHOOK_PATH_SECRET = os.environ.get("NOVOFON_WEBHOOK_PATH_SECRET", "")
 NOVOFON_WEBHOOK_ALLOWED_IPS = {
     value.strip() for value in os.environ.get("NOVOFON_WEBHOOK_ALLOWED_IPS", "37.139.38.215").split(",") if value.strip()
 }
+NOVOFON_INTERACTIVE_PATH_SECRET = os.environ.get("NOVOFON_INTERACTIVE_PATH_SECRET", "")
+NOVOFON_INTERACTIVE_ALLOWED_IPS = {
+    value.strip() for value in os.environ.get("NOVOFON_INTERACTIVE_ALLOWED_IPS", "37.139.38.215").split(",") if value.strip()
+}
+NOVOFON_INTERACTIVE_FORWARD_PHONE = os.environ.get("NOVOFON_INTERACTIVE_FORWARD_PHONE", "")
+NOVOFON_INTERACTIVE_OPERATOR_MEDIA = os.environ.get("NOVOFON_INTERACTIVE_OPERATOR_MEDIA", "")
 NOVOFON_RECORDING_ALLOWED_HOSTS = {
     value.strip().lower()
     for value in os.environ.get("NOVOFON_RECORDING_ALLOWED_HOSTS", "novofon.ru").split(",")
@@ -91,6 +98,27 @@ if NOVOFON_WEBHOOK_SECRET or NOVOFON_WEBHOOK_PATH_SECRET:
         raise RuntimeError("Novofon webhook secrets must be different and at least 32 characters")
     if not NOVOFON_VIRTUAL_NUMBER:
         raise RuntimeError("NOVOFON_VIRTUAL_NUMBER must be configured with Novofon webhook secrets")
+
+NOVOFON_INTERACTIVE_ROUTE: dict[str, list[str] | str] | None = None
+if any((NOVOFON_INTERACTIVE_PATH_SECRET, NOVOFON_INTERACTIVE_FORWARD_PHONE, NOVOFON_INTERACTIVE_OPERATOR_MEDIA)):
+    if not all((NOVOFON_INTERACTIVE_PATH_SECRET, NOVOFON_INTERACTIVE_FORWARD_PHONE, NOVOFON_INTERACTIVE_OPERATOR_MEDIA)):
+        raise RuntimeError("Novofon interactive-call routing requires a path secret, employee phone, and operator media")
+    if len(NOVOFON_INTERACTIVE_PATH_SECRET) < 32:
+        raise RuntimeError("Novofon interactive-call path secret must be at least 32 characters")
+    if (
+        hmac.compare_digest(NOVOFON_INTERACTIVE_PATH_SECRET, NOVOFON_WEBHOOK_PATH_SECRET)
+        or hmac.compare_digest(NOVOFON_INTERACTIVE_PATH_SECRET, NOVOFON_WEBHOOK_SECRET)
+    ):
+        raise RuntimeError("Novofon interactive-call path secret must differ from webhook secrets")
+    if not NOVOFON_INTERACTIVE_ALLOWED_IPS:
+        raise RuntimeError("Novofon interactive-call source allow-list must not be empty")
+    try:
+        NOVOFON_INTERACTIVE_ROUTE = interactive_call_route(
+            NOVOFON_INTERACTIVE_FORWARD_PHONE,
+            NOVOFON_INTERACTIVE_OPERATOR_MEDIA,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=10, open=False, kwargs={"row_factory": dict_row})
 passwords = PasswordHash.recommended()
@@ -719,6 +747,20 @@ def novofon_event(path_secret: str, body: dict[str, Any], request: Request):
     )
     # No CRM interpretation or provider API work happens in the webhook request.
     return Response(status_code=204)
+
+
+@app.post("/api/integrations/novofon/{path_secret}/incoming-route")
+def novofon_interactive_route(path_secret: str, request: Request):
+    """Return Novofon's employee-only chime and forwarding instruction.
+
+    This endpoint intentionally ignores caller data and performs no database,
+    provider API, audio, or CRM work. The ATC scenario owns the error fallback.
+    """
+    if not NOVOFON_INTERACTIVE_ROUTE or not hmac.compare_digest(path_secret, NOVOFON_INTERACTIVE_PATH_SECRET):
+        raise HTTPException(404, "Not found")
+    if remote_ip(request) not in NOVOFON_INTERACTIVE_ALLOWED_IPS:
+        raise HTTPException(403, "Interactive-call source is not allowed")
+    return NOVOFON_INTERACTIVE_ROUTE
 
 
 @app.get("/api/dashboard")

@@ -18,6 +18,7 @@ import httpx
 
 CALL_API_URL = "https://callapi-jsonrpc.novofon.ru/v4.0"
 DATA_API_URL = "https://dataapi-jsonrpc.novofon.ru/v2.0"
+INTERACTIVE_MEDIA_FILENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.mp3\Z", re.IGNORECASE)
 
 
 class NovofonAPIError(RuntimeError):
@@ -36,6 +37,22 @@ def normalize_phone(value: Any) -> str | None:
     if 7 <= len(number) <= 15:
         return number
     return None
+
+
+def interactive_call_route(forward_phone: Any, operator_media: Any) -> dict[str, list[str] | str]:
+    """Build a strictly static Novofon interactive-call routing instruction.
+
+    The provider owns the media file. We only name a safe MP3 from its File
+    Base and return one configured employee phone, without accepting or
+    persisting caller data.
+    """
+    phone = normalize_phone(forward_phone)
+    media = str(operator_media or "").strip()
+    if not phone:
+        raise ValueError("Interactive Novofon route requires a valid employee phone")
+    if not INTERACTIVE_MEDIA_FILENAME.fullmatch(media):
+        raise ValueError("Interactive Novofon operator media must be a safe MP3 filename")
+    return {"phones": [phone], "operator_media": media}
 
 
 def normalize_employee_id(value: Any) -> int | None:

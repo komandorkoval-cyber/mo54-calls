@@ -10,6 +10,7 @@ from novofon import (
     call_session_id,
     event_idempotency_key,
     event_type,
+    interactive_call_route,
     normalize_employee_id,
     normalize_phone,
     NovofonClient,
@@ -45,6 +46,18 @@ class NovofonHelperTests(unittest.TestCase):
     def test_recording_notification_without_explicit_type_is_record_call(self):
         payload = {"call_session_id": "session-42", "file_link": "https://files.novofon.ru/r/abc"}
         self.assertEqual(event_type(payload), "RECORD_CALL")
+
+    def test_interactive_route_has_only_phone_and_employee_chime(self):
+        self.assertEqual(
+            interactive_call_route("8 913 123-45-67", "mo54-work-call-chime.mp3"),
+            {"phones": ["79131234567"], "operator_media": "mo54-work-call-chime.mp3"},
+        )
+
+    def test_interactive_route_rejects_unsafe_media_or_phone(self):
+        with self.assertRaises(ValueError):
+            interactive_call_route("not a phone", "mo54-work-call-chime.mp3")
+        with self.assertRaises(ValueError):
+            interactive_call_route("79131234567", "../chime.mp3")
 
     def test_employee_id_is_a_positive_json_number(self):
         self.assertEqual(normalize_employee_id("100"), 100)
