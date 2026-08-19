@@ -1482,6 +1482,21 @@ def create_cash_movement(deal_id: UUID, body: CashMovementCreate, user: User = D
     return row
 
 
+@app.get("/api/deals/{deal_id}/cashflow")
+def deal_cashflow(deal_id: UUID, user: User = Depends(current_user)):
+    require_deal_access(fetch_one("SELECT id,owner_id FROM deals WHERE id=%s", (deal_id,)), user)
+    movements = fetch_all("SELECT * FROM deal_cash_movements WHERE deal_id=%s ORDER BY confirmed_at DESC", (deal_id,))
+    obligations = fetch_all("SELECT * FROM deal_cost_obligations WHERE deal_id=%s ORDER BY created_at DESC", (deal_id,))
+    incoming = sum((row["amount"] for row in movements if row["kind"] == "customer_incoming"), 0)
+    refunds = sum((row["amount"] for row in movements if row["kind"] == "customer_refund"), 0)
+    realized = sum((row["amount"] for row in movements if row["kind"] == "realized_cost_outflow"), 0)
+    reserves = sum((row["amount"] for row in obligations if row["status"] == "open"), 0)
+    return {"movements": movements, "obligations": obligations, "confirmed_customer_cash": incoming,
+            "refunds": refunds, "net_confirmed_customer_cash": incoming-refunds,
+            "realized_costs": realized, "open_obligations": reserves,
+            "safe_cash": incoming-refunds-realized-reserves}
+
+
 @app.post("/api/deals/{deal_id}/cost-obligations")
 def create_cost_obligation(deal_id: UUID, body: CostObligationCreate, user: User = Depends(current_user)):
     require_deal_access(fetch_one("SELECT id,owner_id FROM deals WHERE id=%s", (deal_id,)), user)
