@@ -261,8 +261,9 @@ function sourcePill(call) {
 
 async function dashboard() {
   setHead('Обзор');
-  const [dashboardData, recentCalls, taskList] = await Promise.all([
+  const [dashboardData, seasonData, recentCalls, taskList] = await Promise.all([
     api('/api/dashboard'),
+    api('/api/dashboard/season'),
     api('/api/calls?limit=5'),
     api('/api/tasks'),
   ]);
@@ -270,6 +271,7 @@ async function dashboard() {
   const conversion = outcomeCount ? Math.round((dashboardData.won_deals || 0) / outcomeCount * 100) : 0;
 
   $('#content').innerHTML = `<section class="hero"><div><h2>Добрый день, ${esc(state.user.display_name)}.</h2><p>Главное на сегодня — не оставить клиента без следующего шага.</p></div><div class="date">${new Intl.DateTimeFormat('ru-RU', { dateStyle: 'full', timeZone: CRM_TIME_ZONE }).format(new Date())}</div></section>
+    <section class="stats"><div class="stat"><small>Заработано владельцем</small><strong>${money(seasonData.earned_owner_income)}</strong><em>цель ${money(seasonData.goal_owner_income)}</em></div><div class="stat"><small>Прогноз дохода</small><strong>${money(seasonData.projected_owner_income)}</strong><em>по текущим сделкам</em></div><div class="stat"><small>Безопасные деньги</small><strong>${money(seasonData.safe_cash)}</strong><em>подтверждённый cashflow</em></div><div class="stat"><small>Осталось до цели</small><strong>${money(seasonData.remaining_to_goal)}</strong><em>по earned income</em></div></section>
     <section class="stats"><div class="stat"><small>Звонков сегодня</small><strong>${dashboardData.calls_today || 0}</strong><em>${dashboardData.ready_today || 0} обработано</em></div><div class="stat"><small>Задач сегодня</small><strong>${dashboardData.tasks_today || 0}</strong><em>в работе</em></div><div class="stat"><small>Просрочено</small><strong>${dashboardData.overdue_tasks || 0}</strong><em class="${dashboardData.overdue_tasks ? 'badge failed' : ''}">требует внимания</em></div><div class="stat"><small>Подтверждённая конверсия</small><strong>${conversion}%</strong><em>${outcomeCount} исходов</em></div></section>
     <section class="grid-2"><div class="panel"><div class="panel-head"><h2>Последние звонки</h2><button class="link" data-action="navigate" data-view="calls">Все звонки →</button></div>${callRows(asArray(recentCalls))}</div><div class="panel"><div class="panel-head"><h2>Ближайшие действия</h2><button class="link" data-action="navigate" data-view="tasks">Все задачи →</button></div>${taskRows(asArray(taskList).slice(0, 6))}</div></section>`;
 }

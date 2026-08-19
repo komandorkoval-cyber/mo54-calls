@@ -49,7 +49,7 @@ INSIGHT_SCHEMA = {
         "timeline", "decision_maker", "lead_stage", "lead_temperature", "objections",
         "manager_responses", "agreements", "customer_promises", "company_promises",
         "next_step", "next_step_date", "next_step_owner", "loss_risk", "outcome",
-        "quality_scores", "recommendations", "evidence", "confidence",
+        "quality_scores", "recommendations", "evidence", "confidence", "commercial_proposal",
     ],
     "properties": {
         "summary": {"type": ["string", "null"]},
@@ -87,6 +87,9 @@ INSIGHT_SCHEMA = {
             },
         },
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "commercial_proposal": {"type": "object", "additionalProperties": False,
+            "required": ["qualification_segment", "budget_range", "pain_primary", "decision_makers", "suggested_stage"],
+            "properties": {"qualification_segment": {"enum": ["under_80k", "over_80k", "unknown", None]}, "budget_range": {"enum": ["under_80", "80_120", "120_160", "160_200", "over_200", "unknown", None]}, "pain_primary": {"type": ["string", "null"]}, "decision_makers": {"type": "array", "items": {"type": "string"}}, "suggested_stage": {"enum": ["new_lead", "contacted", "qualified", "measure_scheduled", "measure_completed", "proposal_sent", "decision_pending", None]}}},
     },
 }
 validator = Draft202012Validator(INSIGHT_SCHEMA)

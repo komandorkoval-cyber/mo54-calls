@@ -128,9 +128,10 @@ def save_insight(call_id: int, insight: dict, model: str, prompt_version: str) -
         cur.execute("UPDATE call_insights SET is_current=false WHERE call_id=%s", (call_id,))
         cur.execute(
             """INSERT INTO call_insights(call_id,version,prompt_version,model,data,confidence)
-               VALUES(%s,%s,%s,%s,%s,%s)""",
+               VALUES(%s,%s,%s,%s,%s,%s) RETURNING id""",
             (call_id, version, prompt_version, model, Json(insight), insight.get("confidence")),
         )
+        insight_id = cur.fetchone()[0]
         cur.execute(
             """UPDATE calls SET theme=%s,client_request=%s,agreements=%s,amount=%s,
                next_step=%s,next_date=%s,raw_json=%s,status='stored',
@@ -140,6 +141,13 @@ def save_insight(call_id: int, insight: dict, model: str, prompt_version: str) -
              insight.get("budget_amount"), insight.get("next_step"),
              insight.get("next_step_date"), Json(insight), call_id),
         )
+        commercial = insight.get("commercial_proposal") or {}
+        if insight.get("product") and any(value not in (None, [], "unknown") for value in commercial.values()):
+            cur.execute(
+                """INSERT INTO ai_action_drafts(call_id,insight_id,kind,payload,evidence)
+                   VALUES(%s,%s,'deal_create',%s,%s) ON CONFLICT(insight_id,kind) DO NOTHING""",
+                (call_id, insight_id, Json({"title": insight["product"], "stage": commercial.get("suggested_stage") or "new_lead", "amount": insight.get("budget_amount"), "quoted_price": insight.get("budget_amount"), "qualification_segment": commercial.get("qualification_segment") or "unknown"}), Json(insight.get("evidence") or [])),
+            )
 
 
 def complete_job(job_id: str, duration_ms: int) -> None:

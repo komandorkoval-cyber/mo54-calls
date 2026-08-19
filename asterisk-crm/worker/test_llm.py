@@ -16,6 +16,7 @@ VALID = {
     "recommendations": ["Уточнить бюджет"],
     "evidence": [{"field": "next_step", "quote": "Пришлю расчёт сегодня"}],
     "confidence": 0.87,
+    "commercial_proposal": {"qualification_segment": "unknown", "budget_range": "unknown", "pain_primary": None, "decision_makers": [], "suggested_stage": None},
 }
 
 
