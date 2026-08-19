@@ -37,6 +37,14 @@ from novofon import (
     normalize_phone,
     recording_url,
 )
+from p0_services import (
+    EconomicsInputs,
+    EconomicsSettings,
+    recognize_income_for_stage,
+    semantic_funnel_stage,
+    settle_cost_obligation,
+    write_economics_revision,
+)
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 # The browser credential is an opaque, server-side session. It is not a JWT
@@ -345,16 +353,82 @@ class DealCreate(BaseModel):
     contact_id: UUID
     call_id: int | None = None
     title: str = Field(min_length=1, max_length=300)
-    stage: Literal["new", "qualified", "proposal", "negotiation", "won", "lost"] = "new"
+    stage: str = "new_lead"
     amount: float | None = Field(None, ge=0)
     probability: int | None = Field(None, ge=0, le=100)
+    qualification_segment: Literal["under_80k", "over_80k", "unknown"] = "unknown"
+    quoted_price: float | None = Field(None, ge=0)
+    final_contract_price: float | None = Field(None, ge=0)
 
 
 class DealPatch(BaseModel):
-    stage: Literal["new", "qualified", "proposal", "negotiation", "won", "lost"] | None = None
+    stage: str | None = None
     amount: float | None = Field(None, ge=0)
     probability: int | None = Field(None, ge=0, le=100)
     loss_reason: str | None = None
+    disqualification_reason: str | None = None
+    next_contact_at: datetime | None = None
+    qualification_segment: Literal["under_80k", "over_80k", "unknown"] | None = None
+    qualification_status: Literal["unknown", "unqualified", "qualified", "high_priority"] | None = None
+    qualification_reason: str | None = None
+    estimated_budget_min: float | None = Field(None, ge=0)
+    estimated_budget_max: float | None = Field(None, ge=0)
+    budget_range: str | None = None
+    decision_makers: list[str] | None = None
+    decision_maker_status: Literal["unknown", "single", "multiple", "other_person_required"] | None = None
+    pain_primary: str | None = None
+    pain_secondary: list[str] | None = None
+    customer_quote: str | None = None
+    customer_quote_evidence: list[dict[str, Any]] | None = None
+    alternative_considered: str | None = None
+    urgency_reason: str | None = None
+    quoted_price: float | None = Field(None, ge=0)
+    final_contract_price: float | None = Field(None, ge=0)
+    installation_mode: Literal["solo", "with_partner", "external_team", "unknown"] | None = None
+    installation_planned_date: datetime | None = None
+
+
+class EconomicsRevisionCreate(BaseModel):
+    quoted_price: float = Field(ge=0)
+    materials_cost: float = Field(0, ge=0)
+    production_cost: float = Field(0, ge=0)
+    seamstress_cost: float = Field(0, ge=0)
+    installation_direct_cost: float = Field(0, ge=0)
+    fuel_cost: float = Field(0, ge=0)
+    other_direct_cost: float = Field(0, ge=0)
+    installation_mode: Literal["solo", "with_partner", "external_team", "unknown"] = "unknown"
+
+
+class EconomicsSettingsCreate(BaseModel):
+    tax_percent: float = Field(ge=0)
+    reserve_percent: float = Field(ge=0)
+    rent_percent: float = Field(ge=0)
+    manager_percent: float = Field(ge=0)
+    marketing_percent: float = Field(ge=0)
+    measure_percent: float = Field(ge=0)
+    owner_ae_share_percent: float = Field(gt=0, le=100)
+    partner_installation_share_percent: float = Field(0, ge=0, le=100)
+    golden_ae_percent: float = Field(10, ge=0)
+    take_ae_percent: float = Field(8, ge=0)
+    max_raise_price_delta_percent: float = Field(15, ge=0)
+    income_recognition_stage: str = "installed"
+
+
+class CashMovementCreate(BaseModel):
+    kind: Literal["customer_incoming", "customer_refund", "realized_cost_outflow", "other_reserved_cash", "other_reserved_cash_release"]
+    amount: float = Field(gt=0)
+    occurred_at: datetime | None = None
+    note: str | None = Field(None, max_length=2000)
+
+
+class CostObligationCreate(BaseModel):
+    amount: float = Field(gt=0)
+    description: str | None = Field(None, max_length=2000)
+    due_date: datetime | None = None
+
+
+class ActionDraftDecision(BaseModel):
+    action: Literal["approve", "reject"]
 
 
 class TaskCreate(BaseModel):
@@ -551,6 +625,44 @@ def require_contact_access(contact_id: UUID, user: User) -> None:
     )
     if not row:
         raise HTTPException(404, "Контакт не найден")
+
+
+def require_deal_access(deal: dict[str, Any] | None, user: User) -> dict[str, Any]:
+    if not deal or (user.role != "admin" and str(deal.get("owner_id") or "") != str(user.id)):
+        raise HTTPException(404, "Сделка не найдена")
+    return deal
+
+
+def deal_stage_transition_allowed(before: dict[str, Any], values: dict[str, Any]) -> None:
+    """Validate only a newly requested semantic state transition.
+
+    Historical rows may legitimately lack P0 fields.  Merely editing such a
+    row therefore does not make it invalid.
+    """
+
+    if "stage" not in values:
+        return
+    try:
+        target = semantic_funnel_stage(values["stage"])
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    current = semantic_funnel_stage(str(before["stage"]))
+    if target == current:
+        return
+    if target == "closed_lost" and not (values.get("loss_reason") or before.get("loss_reason")):
+        raise HTTPException(422, "Для closed_lost требуется причина проигрыша")
+    if target == "disqualified" and not (values.get("disqualification_reason") or before.get("disqualification_reason")):
+        raise HTTPException(422, "Для disqualified требуется причина дисквалификации")
+    if target == "decision_pending" and not (values.get("next_contact_at") or before.get("next_contact_at")):
+        raise HTTPException(422, "Для decision_pending требуется дата следующего контакта")
+
+
+def current_economics_settings(cursor: Any) -> EconomicsSettings:
+    cursor.execute("SELECT * FROM economics_settings_versions ORDER BY version DESC LIMIT 1")
+    row = cursor.fetchone()
+    if not row:
+        raise HTTPException(409, "Не настроены параметры экономики")
+    return EconomicsSettings.from_row(row)
 
 
 def safe_provider_recording_url(url: str | None) -> str | None:
@@ -930,6 +1042,96 @@ def retry_call(call_id: int, stage: Literal["transcribe", "analyze"] = "transcri
     return {"queued": True}
 
 
+@app.post("/api/action-drafts/{draft_id}/decision")
+def decide_action_draft(draft_id: UUID, body: ActionDraftDecision, user: User = Depends(current_user)):
+    """Apply exactly one manually approved AI proposal under a row lock."""
+
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT d.*,c.contact_id,c.owner_id FROM ai_action_drafts d
+               JOIN calls c ON c.id=d.call_id WHERE d.id=%s FOR UPDATE""", (draft_id,)
+        )
+        draft = cur.fetchone()
+        if not draft:
+            raise HTTPException(404, "AI draft не найден")
+        require_call_access(draft, user)
+        if draft["status"] != "pending":
+            raise HTTPException(409, "AI draft уже обработан")
+        if body.action == "reject":
+            cur.execute(
+                """UPDATE ai_action_drafts SET status='rejected',reviewed_by=%s,reviewed_at=now(),updated_at=now()
+                   WHERE id=%s RETURNING *""", (user.id, draft_id)
+            )
+            result = cur.fetchone()
+            conn.commit()
+            audit(user, "ai_action_draft", str(draft_id), "reject", {"status": "pending"}, {"status": "rejected"})
+            return result
+
+        payload = draft["payload"] or {}
+        entity_type = entity_id = None
+        if draft["kind"] == "task_create":
+            cur.execute(
+                """INSERT INTO tasks(contact_id,call_id,assignee_id,title,description,due_at)
+                   VALUES(%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (draft["contact_id"], draft["call_id"], user.id, payload["title"], payload.get("description"), payload.get("due_date")),
+            )
+            entity_type, entity_id = "task", str(cur.fetchone()["id"])
+        elif draft["kind"] == "deal_create":
+            if not draft["contact_id"]:
+                raise HTTPException(422, "Для создания сделки нужен контакт")
+            stage = payload.get("stage") or "new_lead"
+            semantic_funnel_stage(stage)
+            cur.execute(
+                """INSERT INTO deals(contact_id,owner_id,title,stage,amount,quoted_price,qualification_segment)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (draft["contact_id"], user.id, payload["title"], stage, payload.get("amount"),
+                 payload.get("quoted_price"), payload.get("qualification_segment") or "unknown"),
+            )
+            entity_id, entity_type = str(cur.fetchone()["id"]), "deal"
+            cur.execute("INSERT INTO call_deals(call_id,deal_id) VALUES(%s,%s) ON CONFLICT DO NOTHING", (draft["call_id"], entity_id))
+        elif draft["kind"] == "contact_update":
+            cur.execute(
+                """UPDATE contacts SET full_name=coalesce(%s,full_name),email=coalesce(%s,email),
+                   notes=coalesce(%s,notes),updated_at=now() WHERE id=%s RETURNING id""",
+                (payload.get("full_name"), payload.get("email"), payload.get("notes"), draft["contact_id"]),
+            )
+            entity_id, entity_type = str(cur.fetchone()["id"]), "contact"
+        elif draft["kind"] == "deal_update":
+            target = fetch_one("SELECT * FROM deals WHERE id=%s", (draft["target_deal_id"],))
+            require_deal_access(target, user)
+            allowed = {"stage", "qualification_segment", "qualification_status", "qualification_reason",
+                       "estimated_budget_min", "estimated_budget_max", "budget_range", "decision_makers",
+                       "decision_maker_status", "pain_primary", "pain_secondary", "customer_quote",
+                       "customer_quote_evidence", "alternative_considered", "urgency_reason", "next_contact_at"}
+            values = {key: value for key, value in payload.items() if key in allowed}
+            if not values:
+                raise HTTPException(422, "AI draft не содержит разрешённых полей сделки")
+            deal_stage_transition_allowed(target, values)
+            for key in ("decision_makers", "pain_secondary", "customer_quote_evidence"):
+                if key in values:
+                    values[key] = json.dumps(values[key], ensure_ascii=False)
+            cur.execute(
+                f"UPDATE deals SET {','.join(f'{key}=%s' for key in values)},updated_at=now() WHERE id=%s RETURNING id,stage::text AS stage",
+                tuple(values.values()) + (draft["target_deal_id"],),
+            )
+            updated = cur.fetchone()
+            if "stage" in values:
+                recognize_income_for_stage(cur, updated["id"], updated["stage"], user.id)
+            entity_id, entity_type = str(updated["id"]), "deal"
+        else:
+            raise HTTPException(422, "Неподдерживаемый тип AI draft")
+        cur.execute(
+            """UPDATE ai_action_drafts SET status='approved',reviewed_by=%s,reviewed_at=now(),
+               applied_entity_type=%s,applied_entity_id=%s,updated_at=now() WHERE id=%s RETURNING *""",
+            (user.id, entity_type, entity_id, draft_id),
+        )
+        result = cur.fetchone()
+        conn.commit()
+    audit(user, "ai_action_draft", str(draft_id), "approve", {"status": "pending"},
+          {"status": "approved", "entity_type": entity_type, "entity_id": entity_id})
+    return result
+
+
 @app.get("/api/recordings/{recording_id}/open")
 def open_provider_recording(recording_id: UUID, user: User = Depends(current_user)):
     row = fetch_one(
@@ -1127,10 +1329,15 @@ def call_initiation(request_id: UUID, user: User = Depends(current_user)):
 @app.post("/api/deals")
 def create_deal(body: DealCreate, user: User = Depends(current_user)):
     require_contact_access(body.contact_id, user)
+    try:
+        semantic_funnel_stage(body.stage)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     row = execute(
-        """INSERT INTO deals(contact_id,owner_id,title,stage,amount,probability)
-           VALUES(%s,%s,%s,%s,%s,%s) RETURNING *,stage::text AS stage""",
-        (body.contact_id, user.id, body.title, body.stage, body.amount, body.probability),
+        """INSERT INTO deals(contact_id,owner_id,title,stage,amount,probability,qualification_segment,quoted_price,final_contract_price)
+           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *,stage::text AS stage""",
+        (body.contact_id, user.id, body.title, body.stage, body.amount, body.probability,
+         body.qualification_segment, body.quoted_price, body.final_contract_price),
     )
     if body.call_id:
         execute("INSERT INTO call_deals(call_id,deal_id) VALUES(%s,%s) ON CONFLICT DO NOTHING", (body.call_id, row["id"]))
@@ -1141,16 +1348,24 @@ def create_deal(body: DealCreate, user: User = Depends(current_user)):
 @app.patch("/api/deals/{deal_id}")
 def patch_deal(deal_id: UUID, body: DealPatch, user: User = Depends(current_user)):
     before = fetch_one("SELECT * FROM deals WHERE id=%s", (deal_id,))
-    if not before or (user.role != "admin" and str(before["owner_id"]) != str(user.id)):
-        raise HTTPException(404, "Сделка не найдена")
+    require_deal_access(before, user)
     values = body.model_dump(exclude_unset=True)
     if not values:
         return before
-    assignments = [f"{key}=%s" for key in values]
-    after = execute(
-        f"UPDATE deals SET {','.join(assignments)},updated_at=now() WHERE id=%s RETURNING *,stage::text AS stage",
-        tuple(values.values()) + (deal_id,),
-    )
+    deal_stage_transition_allowed(before, values)
+    for json_key in ("decision_makers", "pain_secondary", "customer_quote_evidence"):
+        if json_key in values:
+            values[json_key] = json.dumps(values[json_key], ensure_ascii=False)
+    with pool.connection() as conn, conn.cursor() as cur:
+        assignments = [f"{key}=%s" for key in values]
+        cur.execute(
+            f"UPDATE deals SET {','.join(assignments)},updated_at=now() WHERE id=%s RETURNING *,stage::text AS stage",
+            tuple(values.values()) + (deal_id,),
+        )
+        after = cur.fetchone()
+        if "stage" in values:
+            recognize_income_for_stage(cur, deal_id, after["stage"], user.id)
+        conn.commit()
     audit(user, "deal", str(deal_id), "update", before, after)
     return after
 
@@ -1158,10 +1373,142 @@ def patch_deal(deal_id: UUID, body: DealPatch, user: User = Depends(current_user
 @app.get("/api/deals")
 def deals(user: User = Depends(current_user)):
     return fetch_all(
-        """SELECT d.*,d.stage::text AS stage,ct.full_name AS contact_name,ct.phone_normalized
-           FROM deals d JOIN contacts ct ON ct.id=d.contact_id""" + ("" if user.role == "admin" else " WHERE d.owner_id=%s") + " ORDER BY d.updated_at DESC",
+        """SELECT d.*,d.stage::text AS stage,ct.full_name AS contact_name,ct.phone_normalized,
+                  er.projected_owner_income
+           FROM deals d JOIN contacts ct ON ct.id=d.contact_id
+           LEFT JOIN deal_economics_revisions er ON er.id=d.current_economics_revision_id""" + ("" if user.role == "admin" else " WHERE d.owner_id=%s") + " ORDER BY d.updated_at DESC",
         () if user.role == "admin" else (user.id,),
     )
+
+
+@app.get("/api/deals/{deal_id}/economics/revisions")
+def economics_revisions(deal_id: UUID, user: User = Depends(current_user)):
+    require_deal_access(fetch_one("SELECT id,owner_id FROM deals WHERE id=%s", (deal_id,)), user)
+    return fetch_all(
+        "SELECT * FROM deal_economics_revisions WHERE deal_id=%s ORDER BY revision DESC", (deal_id,)
+    )
+
+
+@app.post("/api/deals/{deal_id}/economics/revisions")
+def create_economics_revision(deal_id: UUID, body: EconomicsRevisionCreate, user: User = Depends(current_user)):
+    require_deal_access(fetch_one("SELECT id,owner_id FROM deals WHERE id=%s", (deal_id,)), user)
+    with pool.connection() as conn, conn.cursor() as cur:
+        settings = current_economics_settings(cur)
+        revision_id, result = write_economics_revision(
+            cur, deal_id, EconomicsInputs.from_row(body.model_dump()), settings, user.id,
+        )
+        cur.execute("UPDATE deals SET quoted_price=%s,updated_at=now() WHERE id=%s", (body.quoted_price, deal_id))
+        cur.execute("SELECT * FROM deal_economics_revisions WHERE id=%s", (revision_id,))
+        row = cur.fetchone()
+        conn.commit()
+    audit(user, "deal_economics_revision", str(revision_id), "create", None,
+          {"deal_id": str(deal_id), "revision": row["revision"], "status": result.economics_status})
+    return row
+
+
+@app.get("/api/admin/economics-settings")
+def economics_settings(user: User = Depends(require_admin)):
+    row = fetch_one("SELECT * FROM economics_settings_versions ORDER BY version DESC LIMIT 1")
+    if not row:
+        raise HTTPException(404, "Настройки экономики не найдены")
+    return row
+
+
+@app.post("/api/admin/economics-settings")
+def create_economics_settings(body: EconomicsSettingsCreate, user: User = Depends(require_admin)):
+    try:
+        semantic_funnel_stage(body.income_recognition_stage)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    values = body.model_dump()
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("LOCK TABLE economics_settings_versions IN SHARE ROW EXCLUSIVE MODE")
+        cur.execute("SELECT coalesce(max(version),0)+1 AS version FROM economics_settings_versions")
+        version = cur.fetchone()["version"]
+        cur.execute(
+            """INSERT INTO economics_settings_versions(
+                 version,tax_percent,reserve_percent,rent_percent,manager_percent,marketing_percent,measure_percent,
+                 owner_ae_share_percent,partner_installation_share_percent,golden_ae_percent,take_ae_percent,
+                 max_raise_price_delta_percent,income_recognition_stage,created_by
+               ) VALUES(%(version)s,%(tax_percent)s,%(reserve_percent)s,%(rent_percent)s,%(manager_percent)s,
+                 %(marketing_percent)s,%(measure_percent)s,%(owner_ae_share_percent)s,%(partner_installation_share_percent)s,
+                 %(golden_ae_percent)s,%(take_ae_percent)s,%(max_raise_price_delta_percent)s,%(income_recognition_stage)s,%(created_by)s)
+               RETURNING *""",
+            {**values, "version": version, "created_by": user.id},
+        )
+        row = cur.fetchone()
+        conn.commit()
+    audit(user, "economics_settings", str(row["id"]), "create", None, {"version": version})
+    return row
+
+
+@app.post("/api/deals/{deal_id}/cash-movements")
+def create_cash_movement(deal_id: UUID, body: CashMovementCreate, user: User = Depends(current_user)):
+    require_deal_access(fetch_one("SELECT id,owner_id FROM deals WHERE id=%s", (deal_id,)), user)
+    row = execute(
+        """INSERT INTO deal_cash_movements(deal_id,kind,amount,occurred_at,confirmed_at,note,created_by)
+           VALUES(%s,%s,%s,coalesce(%s,now()),now(),%s,%s) RETURNING *""",
+        (deal_id, body.kind, body.amount, body.occurred_at, body.note, user.id),
+    )
+    audit(user, "deal_cash_movement", str(row["id"]), "create", None,
+          {"deal_id": str(deal_id), "kind": body.kind, "amount": body.amount})
+    return row
+
+
+@app.post("/api/deals/{deal_id}/cost-obligations")
+def create_cost_obligation(deal_id: UUID, body: CostObligationCreate, user: User = Depends(current_user)):
+    require_deal_access(fetch_one("SELECT id,owner_id FROM deals WHERE id=%s", (deal_id,)), user)
+    row = execute(
+        """INSERT INTO deal_cost_obligations(deal_id,amount,description,due_date,created_by)
+           VALUES(%s,%s,%s,%s,%s) RETURNING *""",
+        (deal_id, body.amount, body.description, body.due_date, user.id),
+    )
+    audit(user, "deal_cost_obligation", str(row["id"]), "create", None,
+          {"deal_id": str(deal_id), "amount": body.amount})
+    return row
+
+
+@app.post("/api/deals/{deal_id}/cost-obligations/{obligation_id}/settle")
+def settle_obligation(deal_id: UUID, obligation_id: UUID, user: User = Depends(current_user)):
+    require_deal_access(fetch_one("SELECT id,owner_id FROM deals WHERE id=%s", (deal_id,)), user)
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT deal_id FROM deal_cost_obligations WHERE id=%s", (obligation_id,))
+        obligation = cur.fetchone()
+        if not obligation or str(obligation["deal_id"]) != str(deal_id):
+            raise HTTPException(404, "Обязательство не найдено")
+        movement_id = settle_cost_obligation(cur, obligation_id, occurred_at=datetime.now(timezone.utc),
+                                             confirmed_at=datetime.now(timezone.utc), actor_id=user.id)
+        cur.execute("SELECT * FROM deal_cash_movements WHERE id=%s", (movement_id,))
+        row = cur.fetchone()
+        conn.commit()
+    audit(user, "deal_cost_obligation", str(obligation_id), "settle", None, {"movement_id": str(movement_id)})
+    return row
+
+
+@app.get("/api/dashboard/season")
+def season_dashboard(user: User = Depends(current_user)):
+    scope = "TRUE" if user.role == "admin" else "d.owner_id=%s"
+    params: tuple[Any, ...] = () if user.role == "admin" else (user.id,)
+    row = fetch_one(f"""
+        WITH scoped_deals AS (SELECT d.* FROM deals d WHERE {scope}),
+        movements AS (SELECT m.* FROM deal_cash_movements m JOIN scoped_deals d ON d.id=m.deal_id),
+        obligations AS (SELECT o.* FROM deal_cost_obligations o JOIN scoped_deals d ON d.id=o.deal_id)
+        SELECT
+          (SELECT goal_owner_income FROM economics_settings_versions ORDER BY version DESC LIMIT 1) AS goal_owner_income,
+          coalesce((SELECT sum(recognized_owner_income) FROM deal_income_recognitions r JOIN scoped_deals d ON d.id=r.deal_id),0) AS earned_owner_income,
+          coalesce((SELECT sum(projected_owner_income) FROM deal_economics_revisions r JOIN scoped_deals d ON d.current_economics_revision_id=r.id),0) AS projected_owner_income,
+          coalesce((SELECT sum(amount) FILTER (WHERE kind='customer_incoming') FROM movements),0)
+            - coalesce((SELECT sum(amount) FILTER (WHERE kind='customer_refund') FROM movements),0) AS net_confirmed_customer_cash,
+          coalesce((SELECT sum(amount) FILTER (WHERE kind='realized_cost_outflow') FROM movements),0) AS realized_cost_outflows,
+          coalesce((SELECT sum(amount) FILTER (WHERE kind='other_reserved_cash') FROM movements),0)
+            - coalesce((SELECT sum(amount) FILTER (WHERE kind='other_reserved_cash_release') FROM movements),0) AS other_reserved_cash,
+          coalesce((SELECT sum(amount) FROM obligations WHERE status='open'),0) AS open_reserved_obligations
+        FROM scoped_deals
+    """, params)
+    row["safe_cash"] = (row["net_confirmed_customer_cash"] - row["realized_cost_outflows"]
+                         - row["open_reserved_obligations"] - row["other_reserved_cash"])
+    row["remaining_to_goal"] = row["goal_owner_income"] - row["earned_owner_income"]
+    return row
 
 
 @app.post("/api/tasks")
@@ -1208,11 +1555,23 @@ def patch_task(task_id: UUID, body: TaskPatch, user: User = Depends(current_user
 
 @app.get("/api/pipeline")
 def pipeline(user: User = Depends(current_user)):
-    return fetch_all(
-        """SELECT stage::text AS stage,count(*)::int AS count,coalesce(sum(amount),0) AS amount
-           FROM deals""" + ("" if user.role == "admin" else " WHERE owner_id=%s") + " GROUP BY stage ORDER BY array_position(ARRAY['new','qualified','proposal','negotiation','won','lost'],stage::text)",
+    rows = fetch_all(
+        """SELECT d.stage::text AS stage,d.qualification_segment,coalesce(d.amount,0) AS amount,
+                  coalesce(er.projected_owner_income,0) AS projected_owner_income
+           FROM deals d LEFT JOIN deal_economics_revisions er ON er.id=d.current_economics_revision_id"""
+        + ("" if user.role == "admin" else " WHERE d.owner_id=%s"),
         () if user.role == "admin" else (user.id,),
     )
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        stage = semantic_funnel_stage(row["stage"])
+        segment = row["qualification_segment"]
+        target = grouped.setdefault((stage, segment), {"stage": stage, "qualification_segment": segment,
+                                                         "count": 0, "amount": 0, "projected_owner_income": 0})
+        target["count"] += 1
+        target["amount"] += row["amount"]
+        target["projected_owner_income"] += row["projected_owner_income"]
+    return list(grouped.values())
 
 
 @app.get("/api/admin/jobs")
