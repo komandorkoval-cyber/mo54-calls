@@ -37,9 +37,53 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
-PROMPT_VERSION = "sales-v1.0"
+PROMPT_VERSION = "sales-v1.1"
 MODEL_NAME = {"gigachat": GIGACHAT_MODEL, "openai": OPENAI_MODEL, "ollama": OLLAMA_MODEL}.get(LLM_PROVIDER, LLM_PROVIDER)
 _token, _token_expiry = "", 0.0
+
+COMMERCIAL_FIELD_VALUE_SCHEMAS = {
+    "qualification_segment": {"enum": ["under_80k", "over_80k", "unknown", None]},
+    "estimated_budget_min": {"type": ["number", "null"], "minimum": 0},
+    "estimated_budget_max": {"type": ["number", "null"], "minimum": 0},
+    "budget_range": {"enum": ["under_80", "80_120", "120_160", "160_200", "over_200", "unknown", None]},
+    "pain_primary": {"type": ["string", "null"]},
+    "pain_secondary": {"type": "array", "items": {"type": "string"}},
+    "customer_quote": {"type": ["string", "null"]},
+    "decision_makers": {"type": "array", "items": {"type": "string"}},
+    "decision_maker_status": {"enum": ["single", "multiple", "other_person_required", "unknown", None]},
+    "alternative_considered": {"type": ["string", "null"]},
+    "alternative_reason": {"type": ["string", "null"]},
+    "desired_install_date": {"type": ["string", "null"], "format": "date"},
+    "desired_install_period": {"type": ["string", "null"]},
+    "next_contact_at": {"type": ["string", "null"], "format": "date-time"},
+    "suggested_stage": {"enum": [
+        "new_lead", "contacted", "qualified", "measure_scheduled", "measure_completed",
+        "proposal_sent", "decision_pending", "contract_signed", "prepayment_received",
+        "production", "installation_scheduled", "installed", "closed_won", "closed_lost",
+        "disqualified", None,
+    ]},
+}
+
+
+def _field_proposal_schema(value_schema: dict) -> dict:
+    return {
+        "type": "object", "additionalProperties": False,
+        "required": ["proposed_value", "confidence", "evidence", "inference_status"],
+        "properties": {
+            "proposed_value": value_schema,
+            "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+            "evidence": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["segment_start_ms", "segment_end_ms", "quote"],
+                "properties": {
+                    "segment_start_ms": {"type": ["integer", "null"], "minimum": 0},
+                    "segment_end_ms": {"type": ["integer", "null"], "minimum": 0},
+                    "quote": {"type": "string", "minLength": 1, "maxLength": 400},
+                },
+            }},
+            "inference_status": {"enum": ["supported", "inferred", "unknown"]},
+        },
+    }
 
 INSIGHT_SCHEMA = {
     "type": "object",
@@ -88,8 +132,11 @@ INSIGHT_SCHEMA = {
         },
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "commercial_proposal": {"type": "object", "additionalProperties": False,
-            "required": ["qualification_segment", "budget_range", "pain_primary", "decision_makers", "suggested_stage"],
-            "properties": {"qualification_segment": {"enum": ["under_80k", "over_80k", "unknown", None]}, "budget_range": {"enum": ["under_80", "80_120", "120_160", "160_200", "over_200", "unknown", None]}, "pain_primary": {"type": ["string", "null"]}, "decision_makers": {"type": "array", "items": {"type": "string"}}, "suggested_stage": {"enum": ["new_lead", "contacted", "qualified", "measure_scheduled", "measure_completed", "proposal_sent", "decision_pending", None]}}},
+            "required": ["fields"],
+            "properties": {"fields": {"type": "object", "additionalProperties": False,
+                "required": list(COMMERCIAL_FIELD_VALUE_SCHEMAS),
+                "properties": {name: _field_proposal_schema(schema)
+                               for name, schema in COMMERCIAL_FIELD_VALUE_SCHEMAS.items()}}}},
     },
 }
 validator = Draft202012Validator(INSIGHT_SCHEMA)
@@ -107,6 +154,32 @@ class LLMError(RuntimeError):
     pass
 
 
+def _validate_commercial_proposal(data: dict) -> None:
+    """Reject invented commercial facts even if their JSON types look valid."""
+
+    fields = data["commercial_proposal"]["fields"]
+    for name, proposal in fields.items():
+        value = proposal["proposed_value"]
+        status = proposal["inference_status"]
+        evidence = proposal["evidence"]
+        unknown_value = value is None or value == [] or value == "unknown"
+        if status == "unknown":
+            if not unknown_value:
+                raise LLMError(f"{name}: unknown field must not contain a proposed value")
+            if evidence:
+                raise LLMError(f"{name}: unknown field must not contain evidence")
+            continue
+        if unknown_value:
+            raise LLMError(f"{name}: supported/inferred field needs a value")
+        if proposal["confidence"] is None:
+            raise LLMError(f"{name}: supported/inferred field needs confidence")
+        if not evidence:
+            raise LLMError(f"{name}: supported/inferred field needs evidence")
+        for item in evidence:
+            if item["segment_start_ms"] is None and item["segment_end_ms"] is None:
+                raise LLMError(f"{name}: evidence must reference a transcript segment")
+
+
 def _parse(raw: str) -> dict:
     text = raw.strip()
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL)
@@ -120,6 +193,7 @@ def _parse(raw: str) -> dict:
     if errors:
         details = "; ".join(f"{'.'.join(map(str, e.path)) or '$'}: {e.message}" for e in errors[:8])
         raise LLMError(f"Insight schema validation failed: {details}")
+    _validate_commercial_proposal(data)
     return data
 
 

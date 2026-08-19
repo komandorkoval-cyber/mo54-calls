@@ -197,6 +197,9 @@ document.addEventListener('click', event => {
   if (action === 'retry-call' && Number.isSafeInteger(numericId) && numericId > 0 && control.dataset.stage) {
     retryCall(numericId, control.dataset.stage);
   }
+  if (action === 'draft-decision' && Number.isSafeInteger(numericId) && numericId > 0 && control.dataset.draftId && control.dataset.decision) {
+    decideActionDraft(numericId, control.dataset.draftId, control.dataset.decision);
+  }
 });
 
 function setHead(title, eyebrow = 'РАБОЧЕЕ ПРОСТРАНСТВО') {
@@ -358,6 +361,43 @@ function insightMarkup(call, insightData) {
   return `<div class="insight-list">${insight('Резюме', insightData.summary)}${insight('Потребность', insightData.customer_need)}${insight('Продукт', insightData.product)}${insight('Бюджет', insightData.budget_amount)}${insight('Стадия', insightData.lead_stage)}${insight('Возражения', asArray(insightData.objections).join('; '))}${insight('Следующий шаг', insightData.next_step)}${insight('Риск потери', insightData.loss_risk)}${asArray(insightData.recommendations).length ? `<div class="recommend"><b>Что улучшить</b><p>${esc(asArray(insightData.recommendations).join(' · '))}</p></div>` : ''}${asArray(insightData.evidence).slice(0, 3).map(quote => `<div class="quote">«${esc(quote.quote)}»</div>`).join('')}</div>`;
 }
 
+function previewValue(value) {
+  if (value == null || value === '') return '—';
+  return typeof value === 'object' ? JSON.stringify(value) : String(value);
+}
+
+function evidenceMarkup(items) {
+  return asArray(items).map(item => {
+    const start = item.segment_start_ms == null ? '?' : item.segment_start_ms;
+    const end = item.segment_end_ms == null ? '?' : item.segment_end_ms;
+    return `<small class="draft-evidence">${start}–${end} мс · «${esc(item.quote || '')}»</small>`;
+  }).join('') || '<small class="muted">Нет подтверждения</small>';
+}
+
+function actionDraftMarkup(drafts, previews, callId) {
+  if (!drafts.length) return '';
+  return `<section class="panel"><h2>Предложения ИИ</h2>${drafts.map(draft => {
+    const preview = previews[draft.id];
+    const pending = draft.status === 'pending';
+    const stale = Boolean(preview?.stale);
+    const diff = draft.kind === 'deal_update' && preview
+      ? `<div class="draft-diff"><div class="draft-diff-head"><small>Поле</small><small>Текущее</small><small>Предложенное</small><small>Confidence / evidence</small></div>${asArray(preview.diff).map(item => `<div class="draft-diff-row ${item.conflict ? 'conflict' : ''}"><b>${esc(item.field)}</b><span>${esc(previewValue(item.current_value))}</span><span>${esc(previewValue(item.proposed_value))}</span><span>${item.confidence == null ? '—' : `${Math.round(Number(item.confidence) * 100)}%`} · ${esc(item.inference_status || 'unknown')}${evidenceMarkup(item.evidence)}</span></div>`).join('')}</div>${stale ? `<p class="error">Черновик устарел: ${esc(asArray(preview.conflicts).join(', '))}. Обновление не будет применено.</p>` : ''}`
+      : `<p class="muted">${esc(draft.kind)} · ${esc(previewValue(draft.payload))}</p>${evidenceMarkup(draft.evidence)}`;
+    const actions = pending ? `<div class="actions"><button class="primary" type="button" data-action="draft-decision" data-call-id="${Number(callId)}" data-draft-id="${esc(draft.id)}" data-decision="approve" ${stale ? 'disabled' : ''}>Применить черновик</button><button class="secondary" type="button" data-action="draft-decision" data-call-id="${Number(callId)}" data-draft-id="${esc(draft.id)}" data-decision="reject">Отклонить</button></div>` : `<span class="badge ${esc(draft.status)}">${esc(draft.status)}</span>`;
+    return `<article class="draft-card"><div class="panel-head"><b>${esc(draft.kind)}</b><span class="badge">${esc(draft.status)}</span></div>${diff}${actions}</article>`;
+  }).join('')}</section>`;
+}
+
+async function decideActionDraft(callId, draftId, decision) {
+  try {
+    await api(`/api/action-drafts/${encodeURIComponent(draftId)}/decision`, { method: 'POST', body: { action: decision } });
+    toast(decision === 'approve' ? 'Черновик применён' : 'Черновик отклонён');
+    await callDetail(callId);
+  } catch (failure) {
+    toast(failure.message);
+  }
+}
+
 async function callDetail(id) {
   setHead('Карточка звонка', 'РАЗБОР РАЗГОВОРА');
   const call = await api(`/api/calls/${id}`);
@@ -365,8 +405,14 @@ async function callDetail(id) {
   const contact = call.contact || {};
   const localRecording = localRecordings(call)[0];
   const showRetryActions = !isNovofon(call) || call.transcription_available === true || call.analysis_available === true;
+  const drafts = asArray(call.action_drafts);
+  const previewPairs = await Promise.all(drafts.filter(draft => draft.kind === 'deal_update').map(async draft => {
+    try { return [draft.id, await api(`/api/action-drafts/${encodeURIComponent(draft.id)}/preview`)]; } catch (_error) { return [draft.id, null]; }
+  }));
+  const draftPreviews = Object.fromEntries(previewPairs);
 
   $('#content').innerHTML = `<div class="call-layout"><section><div class="panel"><div class="panel-head"><div><h2>${esc(contact.full_name || contact.phone_normalized || 'Неизвестный клиент')}</h2><div class="detail-meta">${sourcePill(call)} ${recordingStatus(call) ? `<span class="muted">${esc(labels[recordingStatus(call)] || recordingStatus(call))}</span>` : ''}</div></div>${statusPill(callStatus(call))}</div>${recordingPanel(call)}<h2>Транскрипт</h2><div class="transcript">${esc(transcriptText(call))}</div></div></section><aside-detail><div class="panel"><div class="panel-head"><h2>Выводы ИИ</h2><small class="muted">${insightData.confidence != null ? `${Math.round(insightData.confidence * 100)}% уверенность` : ''}</small></div>${insightMarkup(call, insightData)}</div><div class="panel"><h2>Данные клиента</h2><form class="form" id="contact-form"><label>Имя<input name="contact_name" value="${esc(contact.full_name || '')}"></label><label>Email<input name="contact_email" value="${esc(contact.email || '')}"></label><label>Заметка<textarea name="contact_notes">${esc(contact.notes || '')}</textarea></label><button class="primary">Сохранить</button></form></div>${contact.id ? `<div class="panel"><h2>Новая сделка</h2><form class="form" id="deal-form"><label>Название<input name="title" required value="${esc(insightData.product || 'Сделка по звонку')}"></label><label>Сумма<input name="amount" type="number" min="0" value="${esc(insightData.budget_amount || '')}"></label><label>Этап<select name="stage">${['new', 'qualified', 'proposal', 'negotiation'].map(stage => `<option value="${stage}" ${insightData.lead_stage === stage ? 'selected' : ''}>${labels[stage]}</option>`).join('')}</select></label><button class="primary">Создать сделку</button></form></div>` : ''}<div class="panel"><div class="panel-head"><h2>Следующий шаг</h2></div><form class="form" id="task-form"><label>Что сделать<input name="title" required value="${esc(insightData.next_step || '')}"></label><label>Когда<input name="due_at" type="datetime-local"></label><button class="primary">Создать задачу</button></form></div>${showRetryActions ? `<div class="actions"><button class="secondary" type="button" data-action="retry-call" data-call-id="${Number(id)}" data-stage="transcribe">Повторить ASR</button><button class="secondary" type="button" data-action="retry-call" data-call-id="${Number(id)}" data-stage="analyze">Повторить анализ</button></div>` : ''}</aside-detail></div>`;
+  if (drafts.length) $('aside-detail').insertAdjacentHTML('beforeend', actionDraftMarkup(drafts, draftPreviews, id));
 
   if (localRecording?.id) await loadAudio(localRecording.id);
 
@@ -597,17 +643,21 @@ async function pipeline() {
 
 async function admin() {
   setHead('Обработка', 'ТЕХНИЧЕСКОЕ СОСТОЯНИЕ');
-  const [jobs, mappingsResponse] = await Promise.all([
+  const [jobs, mappingsResponse, reasonsResponse] = await Promise.all([
     api('/api/admin/jobs'),
     api('/api/admin/novofon/employee-mappings').catch(() => []),
+    api('/api/admin/deal-reasons').catch(() => []),
   ]);
   const mappings = asArray(mappingsResponse?.items || mappingsResponse);
+  const reasons = asArray(reasonsResponse);
   const ownMapping = mappings.find(mapping => String(mapping.crm_user_id || mapping.user_id) === String(state.user.id)) || {};
   const mappingRows = mappings.length
     ? `<table class="table mapping-table"><thead><tr><th>Пользователь CRM</th><th>Сотрудник Novofon</th><th>Мобильный</th><th>Внутренний</th></tr></thead><tbody>${mappings.map(mapping => `<tr><td>${esc(mapping.crm_user_name || mapping.user_display_name || mapping.crm_user_id || mapping.user_id)}</td><td>${esc(mapping.provider_employee_id || mapping.employee_id)}</td><td>${esc(mapping.mobile_phone || '—')}</td><td>${esc(mapping.provider_extension || mapping.extension_phone_number || '—')}</td></tr>`).join('')}</tbody></table>`
     : '<p class="muted">Пока нет сопоставлений. Добавьте сотрудника, который будет принимать callback-звонки.</p>';
 
   $('#content').innerHTML = `<div class="admin-stack"><section class="panel"><div class="panel-head"><div><h2>Сотрудники Novofon</h2><small class="muted">Нужны только для callback-звонка. Ключи API здесь не хранятся.</small></div>${sourcePill({ source: 'novofon' })}</div><form class="form mapping-form" id="novofon-mapping-form"><label>Пользователь CRM<input name="crm_user_id" value="${esc(ownMapping.crm_user_id || ownMapping.user_id || state.user.id)}" readonly></label><label>ID сотрудника Novofon<input name="provider_employee_id" inputmode="numeric" required value="${esc(ownMapping.provider_employee_id || ownMapping.employee_id || '')}" placeholder="Например, 12345"></label><label>Мобильный сотрудника<input name="mobile_phone" inputmode="tel" required value="${esc(ownMapping.mobile_phone || '')}" placeholder="79001234567"></label><label>Внутренний номер (необязательно)<input name="provider_extension" inputmode="numeric" value="${esc(ownMapping.provider_extension || ownMapping.extension_phone_number || '')}"></label><label>Имя для CRM (необязательно)<input name="display_name" value="${esc(ownMapping.display_name || ownMapping.employee_full_name || '')}"></label><button class="primary" type="submit">Сохранить сотрудника</button></form><div id="mapping-error" class="error"></div></section><section class="panel"><h2>Настроенные сопоставления</h2>${mappingRows}</section><section class="panel"><h2>Очередь обработки</h2><table class="table"><thead><tr><th>Звонок</th><th>Этап</th><th>Статус</th><th>Попытки</th><th>Ошибка</th><th>Обновлено</th></tr></thead><tbody>${asArray(jobs).map(job => `<tr class="clickable-row" data-action="call-detail" data-call-id="${Number(job.call_id)}"><td>${esc(job.call_id)}</td><td>${esc(job.kind)}</td><td><span class="badge ${esc(job.status)}">${esc(job.status)}</span></td><td>${job.attempts || 0}/${job.max_attempts || 0}</td><td>${esc(job.last_error || '—')}</td><td>${fmtDate(job.updated_at)}</td></tr>`).join('')}</tbody></table></section></div>`;
+
+  $('#content').insertAdjacentHTML('beforeend', `<section class="panel"><h2>Причины потери и дисквалификации</h2><form class="form compact-form" id="reason-create-form"><label>Тип<select name="kind"><option value="lost">Потеря</option><option value="disqualified">Дисквалификация</option></select></label><label>Код<input name="code" required pattern="[a-z0-9_]+" placeholder="price_too_high"></label><label>Название<input name="label" required></label><button class="primary">Добавить причину</button></form><div class="reason-catalog">${reasons.map(reason => `<form class="reason-row" data-reason-form="${esc(reason.id)}"><span class="badge ${reason.active ? 'completed' : ''}">${esc(reason.kind)}</span><label>Код<small>${esc(reason.code)}</small></label><label>Название<input name="label" value="${esc(reason.label)}" required></label><label class="reason-active"><input name="active" type="checkbox" ${reason.active ? 'checked' : ''}> Активна</label><button class="secondary">Сохранить</button></form>`).join('') || '<p class="muted">Причин пока нет.</p>'}</div></section>`);
 
   $('#novofon-mapping-form').onsubmit = async event => {
     event.preventDefault();
@@ -630,6 +680,25 @@ async function admin() {
       submit.disabled = false;
     }
   };
+  $('#reason-create-form').onsubmit = async event => {
+    event.preventDefault();
+    const payload = Object.fromEntries(new FormData(event.currentTarget));
+    try {
+      await api('/api/admin/deal-reasons', { method: 'POST', body: payload });
+      toast('Причина добавлена');
+      await admin();
+    } catch (failure) { toast(failure.message); }
+  };
+  $$('[data-reason-form]').forEach(form => form.onsubmit = async event => {
+    event.preventDefault();
+    const payload = Object.fromEntries(new FormData(form));
+    payload.active = form.elements.active.checked;
+    try {
+      await api(`/api/admin/deal-reasons/${encodeURIComponent(form.dataset.reasonForm)}`, { method: 'PATCH', body: payload });
+      toast(payload.active ? 'Причина сохранена' : 'Причина отключена');
+      await admin();
+    } catch (failure) { toast(failure.message); }
+  });
 }
 
 start();

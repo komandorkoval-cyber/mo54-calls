@@ -169,5 +169,234 @@ class CashflowWorkspaceMarkupTests(unittest.TestCase):
             self.assertIn(required, source)
 
 
+def unknown_field(value=None):
+    return {"proposed_value": value, "confidence": None, "evidence": [], "inference_status": "unknown"}
+
+
+def deal_update_payload(*, pain="Новая боль", stage=None, next_contact=None, baseline_pain="Старая боль"):
+    fields = {
+        name: unknown_field([] if name in {"pain_secondary", "decision_makers"} else None)
+        for name in app.AI_DEAL_UPDATE_FIELDS
+    }
+    fields["pain_primary"] = {
+        "proposed_value": pain, "confidence": 0.92,
+        "evidence": [{"segment_start_ms": 100, "segment_end_ms": 900, "quote": "Нам нужна защита от дождя"}],
+        "inference_status": "supported",
+    }
+    if stage is not None:
+        fields["suggested_stage"] = {
+            "proposed_value": stage, "confidence": 0.9,
+            "evidence": [{"segment_start_ms": 1000, "segment_end_ms": 1800, "quote": "Созвонимся позже"}],
+            "inference_status": "supported",
+        }
+    if next_contact is not None:
+        fields["next_contact_at"] = {
+            "proposed_value": next_contact, "confidence": 0.9,
+            "evidence": [{"segment_start_ms": 1000, "segment_end_ms": 1800, "quote": "Созвонимся завтра"}],
+            "inference_status": "supported",
+        }
+    baseline = {"stage": "qualified", **{field: None for field in app.AI_DEAL_UPDATE_FIELDS if field != "suggested_stage"}}
+    baseline["pain_primary"] = baseline_pain
+    return {"proposed_fields": fields, "base_values": baseline}
+
+
+class DraftCursor:
+    def __init__(self, draft, target):
+        self.draft = draft
+        self.target = target
+        self.current = None
+        self.deal_update_count = 0
+        self.audit_count = 0
+
+    def execute(self, sql, params=()):
+        if "FROM ai_action_drafts d" in sql:
+            self.current = self.draft
+        elif "FROM deals d JOIN calls" in sql:
+            self.current = self.target
+        elif sql.startswith("UPDATE deals SET"):
+            self.deal_update_count += 1
+            if "pain_primary=%s" in sql:
+                self.target["pain_primary"] = params[0]
+            if "stage=%s" in sql:
+                self.target["stage"] = params[0]
+            self.current = {"id": self.target["id"], "stage": self.target["stage"]}
+        elif "UPDATE ai_action_drafts SET status='approved'" in sql:
+            self.draft["status"] = "approved"
+            self.current = self.draft
+        elif "UPDATE ai_action_drafts SET status='rejected'" in sql:
+            self.draft["status"] = "rejected"
+            self.current = self.draft
+        elif "INSERT INTO audit_log" in sql:
+            self.audit_count += 1
+            self.current = None
+        elif "SELECT active FROM deal_reason_catalog" in sql:
+            self.current = {"active": True}
+        else:
+            raise AssertionError(sql)
+
+    def fetchone(self):
+        return self.current
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class DraftConnection:
+    def __init__(self, cursor):
+        self.cursor_value = cursor
+        self.commits = 0
+
+    def cursor(self):
+        return self.cursor_value
+
+    def commit(self):
+        self.commits += 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class DraftPool:
+    def __init__(self, connection):
+        self.connection_value = connection
+
+    def connection(self):
+        return self.connection_value
+
+
+class DealUpdateDraftTests(unittest.TestCase):
+    def setUp(self):
+        self.user = app.User(id=uuid4(), email="owner@example.test", display_name="Owner", role="manager")
+        self.deal_id = uuid4()
+        self.draft_id = uuid4()
+
+    def state(self, *, payload=None, target_owner=None, current_pain="Старая боль"):
+        draft = {
+            "id": self.draft_id, "call_id": 77, "contact_id": uuid4(), "owner_id": self.user.id,
+            "kind": "deal_update", "status": "pending", "target_deal_id": self.deal_id,
+            "payload": payload or deal_update_payload(),
+        }
+        target = {"id": self.deal_id, "contact_id": draft["contact_id"], "owner_id": target_owner or self.user.id,
+                  "stage": "qualified", "pain_primary": current_pain}
+        cursor = DraftCursor(draft, target)
+        return draft, target, cursor, DraftConnection(cursor)
+
+    def test_existing_deal_update_approves_once_without_creating_another_deal(self):
+        draft, target, cursor, connection = self.state()
+        with patch.object(app, "pool", DraftPool(connection)):
+            result = app.decide_action_draft(self.draft_id, app.ActionDraftDecision(action="approve"), self.user)
+            with self.assertRaises(HTTPException) as repeated:
+                app.decide_action_draft(self.draft_id, app.ActionDraftDecision(action="approve"), self.user)
+        self.assertEqual(result["status"], "approved")
+        self.assertEqual(target["pain_primary"], "Новая боль")
+        self.assertEqual(cursor.deal_update_count, 1)
+        self.assertEqual(repeated.exception.status_code, 409)
+        self.assertEqual(cursor.audit_count, 1)
+        self.assertEqual(connection.commits, 1)
+
+    def test_stale_draft_does_not_overwrite_manager_change(self):
+        _draft, target, cursor, connection = self.state(current_pain="Изменено менеджером")
+        with patch.object(app, "pool", DraftPool(connection)), patch.object(app, "audit"):
+            with self.assertRaises(HTTPException) as error:
+                app.decide_action_draft(self.draft_id, app.ActionDraftDecision(action="approve"), self.user)
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertEqual(target["pain_primary"], "Изменено менеджером")
+        self.assertEqual(cursor.deal_update_count, 0)
+
+    def test_rbac_denies_ai_update_to_foreign_target_deal(self):
+        _draft, _target, _cursor, connection = self.state(target_owner=uuid4())
+        with patch.object(app, "pool", DraftPool(connection)), patch.object(app, "audit"):
+            with self.assertRaises(HTTPException) as error:
+                app.decide_action_draft(self.draft_id, app.ActionDraftDecision(action="approve"), self.user)
+        self.assertEqual(error.exception.status_code, 404)
+
+    def test_ai_stage_suggestion_uses_normal_transition_validation(self):
+        payload = deal_update_payload(stage="decision_pending")
+        _draft, _target, cursor, connection = self.state(payload=payload)
+        with patch.object(app, "pool", DraftPool(connection)), patch.object(app, "audit"):
+            with self.assertRaises(HTTPException) as error:
+                app.decide_action_draft(self.draft_id, app.ActionDraftDecision(action="approve"), self.user)
+        self.assertEqual(error.exception.status_code, 422)
+        self.assertEqual(cursor.deal_update_count, 0)
+
+    def test_preview_shows_current_proposed_confidence_and_evidence(self):
+        draft, target, _cursor, _connection = self.state()
+        with patch.object(app, "fetch_one", side_effect=[draft, target]):
+            preview = app.action_draft_preview(self.draft_id, self.user)
+        self.assertFalse(preview["stale"])
+        self.assertEqual(preview["diff"][0]["field"], "pain_primary")
+        self.assertEqual(preview["diff"][0]["current_value"], "Старая боль")
+        self.assertEqual(preview["diff"][0]["proposed_value"], "Новая боль")
+        self.assertEqual(preview["diff"][0]["evidence"][0]["segment_start_ms"], 100)
+
+    def test_ai_payload_cannot_include_commercial_price_or_cashflow_fields(self):
+        payload = deal_update_payload()
+        payload["proposed_fields"]["quoted_price"] = {
+            "proposed_value": 1, "confidence": 1,
+            "evidence": [{"segment_start_ms": 1, "segment_end_ms": 2, "quote": "Нельзя"}],
+            "inference_status": "supported",
+        }
+        values, _fields, _baseline = app.ai_deal_update_values(payload)
+        self.assertEqual(set(values), {"pain_primary"})
+
+
+class ReasonCatalogPolicyTests(unittest.TestCase):
+    def test_disabled_reason_cannot_be_selected_for_new_transition(self):
+        class Cursor:
+            def execute(self, *_args):
+                pass
+
+            def fetchone(self):
+                return {"active": False}
+
+        before = {"stage": "proposal", "loss_reason": None, "disqualification_reason": None}
+        with self.assertRaises(HTTPException) as error:
+            app.validate_transition_reason_catalog(Cursor(), before, {"stage": "closed_lost", "loss_reason": "old_reason"})
+        self.assertEqual(error.exception.status_code, 422)
+
+    def test_only_admin_can_modify_reason_catalog(self):
+        manager = app.User(id=uuid4(), email="manager@example.test", display_name="Manager", role="manager")
+        with self.assertRaises(HTTPException) as error:
+            app.require_admin(manager)
+        self.assertEqual(error.exception.status_code, 403)
+
+    def test_admin_catalog_create_and_disable_are_audited(self):
+        admin = app.User(id=uuid4(), email="admin@example.test", display_name="Admin", role="admin")
+        reason_id = uuid4()
+        created = {"id": reason_id, "kind": "lost", "code": "other_price", "label": "Другая цена", "active": True}
+        disabled = {**created, "active": False}
+        with patch.object(app, "execute", side_effect=[created, disabled]), patch.object(
+            app, "fetch_one", return_value=created
+        ), patch.object(app, "audit") as audit:
+            app.create_deal_reason(app.ReasonCatalogCreate(kind="lost", code="other_price", label="Другая цена"), admin)
+            app.update_deal_reason(reason_id, app.ReasonCatalogPatch(active=False), admin)
+        self.assertEqual(audit.call_count, 2)
+        self.assertEqual(audit.call_args_list[1].args[3], "disable")
+
+    def test_disabled_reason_remains_in_historical_deal_detail(self):
+        user = app.User(id=uuid4(), email="owner@example.test", display_name="Owner", role="manager")
+        deal = {"id": uuid4(), "owner_id": user.id, "loss_reason": "old_reason", "disqualification_reason": None}
+        disabled = {"kind": "lost", "code": "old_reason", "label": "Старая причина", "active": False}
+        with patch.object(app, "fetch_one", side_effect=[deal, disabled]), patch.object(app, "fetch_all", return_value=[]):
+            result = app.deal_detail(deal["id"], user)
+        self.assertFalse(result["loss_reason_catalog"]["active"])
+
+
+class AIDraftWorkspaceMarkupTests(unittest.TestCase):
+    def test_call_and_admin_workspaces_expose_preview_decision_and_catalog_controls(self):
+        source = (Path(__file__).parent / "static" / "app.js").read_text(encoding="utf-8")
+        for required in (
+            '/preview', 'draft-diff', 'data-action="draft-decision"', 'Применить черновик',
+            'Отклонить', '/api/admin/deal-reasons', 'reason-create-form', 'data-reason-form=',
+        ):
+            self.assertIn(required, source)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,8 @@ import hashlib
 import json
 import os
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
@@ -10,6 +11,88 @@ from psycopg2.extras import Json, RealDictCursor
 from novofon import NovofonEvent, normalize_phone, parse_event
 
 DATABASE_URL = os.environ["DATABASE_URL"]
+
+AI_DEAL_UPDATE_FIELDS = (
+    "qualification_segment", "estimated_budget_min", "estimated_budget_max", "budget_range",
+    "pain_primary", "pain_secondary", "customer_quote", "decision_makers", "decision_maker_status",
+    "alternative_considered", "alternative_reason", "desired_install_date", "desired_install_period",
+    "next_contact_at", "suggested_stage",
+)
+DEAL_SNAPSHOT_FIELDS = tuple("stage" if field == "suggested_stage" else field for field in AI_DEAL_UPDATE_FIELDS)
+
+
+def _json_safe(value):
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    return value
+
+
+def _commercial_fields(insight: dict) -> dict:
+    commercial = insight.get("commercial_proposal") or {}
+    fields = commercial.get("fields") or {}
+    return fields if isinstance(fields, dict) else {}
+
+
+def _actionable(proposal: dict | None) -> bool:
+    if not isinstance(proposal, dict) or proposal.get("inference_status") not in {"supported", "inferred"}:
+        return False
+    value = proposal.get("proposed_value")
+    return value not in (None, [], "unknown")
+
+
+def build_deal_update_payload(insight: dict, deal_snapshot: dict) -> tuple[dict, list[dict]] | None:
+    """Build a reviewable, field-level proposal; never a business mutation."""
+
+    fields = _commercial_fields(insight)
+    if not any(_actionable(fields.get(field)) for field in AI_DEAL_UPDATE_FIELDS):
+        return None
+    normalized_fields = {field: fields[field] for field in AI_DEAL_UPDATE_FIELDS if field in fields}
+    if len(normalized_fields) != len(AI_DEAL_UPDATE_FIELDS):
+        return None
+    evidence = [
+        {"field": field, **item, "inference_status": proposal["inference_status"]}
+        for field, proposal in normalized_fields.items()
+        for item in proposal.get("evidence", [])
+    ]
+    return ({
+        "proposed_fields": _json_safe(normalized_fields),
+        "base_values": _json_safe({field: deal_snapshot.get(field) for field in DEAL_SNAPSHOT_FIELDS}),
+    }, evidence)
+
+
+def _deal_snapshots(cursor, where_sql: str, params: tuple) -> list[dict]:
+    columns = ("id", *DEAL_SNAPSHOT_FIELDS)
+    projection = ",".join("d.stage::text AS stage" if field == "stage" else f"d.{field}" for field in columns)
+    cursor.execute(f"SELECT {projection} {where_sql}", params)
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def unambiguous_accessible_deal_for_call(cursor, call_id: int) -> dict | None:
+    """Use existing call/contact/deal relations; do not guess when more than one fits."""
+
+    direct = _deal_snapshots(
+        cursor,
+        """FROM call_deals cd JOIN calls c ON c.id=cd.call_id JOIN deals d ON d.id=cd.deal_id
+           WHERE cd.call_id=%s AND d.owner_id=c.owner_id""",
+        (call_id,),
+    )
+    if len(direct) == 1:
+        return direct[0]
+    if len(direct) > 1:
+        return None
+    related = _deal_snapshots(
+        cursor,
+        """FROM calls c JOIN deals d ON d.contact_id=c.contact_id
+           WHERE c.id=%s AND d.owner_id=c.owner_id""",
+        (call_id,),
+    )
+    return related[0] if len(related) == 1 else None
 
 
 @contextmanager
@@ -141,12 +224,33 @@ def save_insight(call_id: int, insight: dict, model: str, prompt_version: str) -
              insight.get("budget_amount"), insight.get("next_step"),
              insight.get("next_step_date"), Json(insight), call_id),
         )
-        commercial = insight.get("commercial_proposal") or {}
-        if insight.get("product") and any(value not in (None, [], "unknown") for value in commercial.values()):
+        fields = _commercial_fields(insight)
+        target_deal = unambiguous_accessible_deal_for_call(cur, call_id)
+        update_draft = build_deal_update_payload(insight, target_deal) if target_deal else None
+        if target_deal:
+            if update_draft:
+                payload, evidence = update_draft
+                cur.execute(
+                    """INSERT INTO ai_action_drafts(
+                           call_id,insight_id,kind,target_deal_id,payload,evidence,base_deal_snapshot,proposal_schema_version
+                       ) VALUES(%s,%s,'deal_update',%s,%s,%s,%s,'p0-deal-update-v1')
+                       ON CONFLICT(insight_id,kind) DO NOTHING""",
+                    (call_id, insight_id, target_deal["id"], Json(payload), Json(evidence),
+                     Json(payload["base_values"])),
+                )
+        elif insight.get("product") and any(_actionable(fields.get(field)) for field in AI_DEAL_UPDATE_FIELDS):
+            qualification = fields["qualification_segment"].get("proposed_value") if _actionable(fields.get("qualification_segment")) else "unknown"
+            suggested_stage = fields["suggested_stage"].get("proposed_value") if _actionable(fields.get("suggested_stage")) else "new_lead"
+            evidence = [
+                {"field": field, **item, "inference_status": proposal["inference_status"]}
+                for field, proposal in fields.items() if isinstance(proposal, dict)
+                for item in proposal.get("evidence", [])
+            ]
             cur.execute(
                 """INSERT INTO ai_action_drafts(call_id,insight_id,kind,payload,evidence)
                    VALUES(%s,%s,'deal_create',%s,%s) ON CONFLICT(insight_id,kind) DO NOTHING""",
-                (call_id, insight_id, Json({"title": insight["product"], "stage": commercial.get("suggested_stage") or "new_lead", "amount": insight.get("budget_amount"), "quoted_price": insight.get("budget_amount"), "qualification_segment": commercial.get("qualification_segment") or "unknown"}), Json(insight.get("evidence") or [])),
+                (call_id, insight_id, Json({"title": insight["product"], "stage": suggested_stage or "new_lead",
+                                            "qualification_segment": qualification or "unknown"}), Json(evidence)),
             )
 
 

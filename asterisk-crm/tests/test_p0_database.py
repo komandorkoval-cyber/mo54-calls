@@ -28,6 +28,7 @@ P0_010 = SQL / "010_p0_ai_proposals_audit.sql"
 P0_AFTER_010 = [
     SQL / "011_p0_price_floor_override.sql",
     SQL / "012_p0_cash_movement_reversals.sql",
+    SQL / "013_p0_ai_deal_update_and_reason_catalogs.sql",
 ]
 
 
@@ -142,6 +143,13 @@ class P0DatabaseMigrationTests(unittest.TestCase):
             "ai_action_drafts", "deal_cash_movements", "deal_cost_obligations",
             "deal_economics_revisions", "deal_income_recognitions", "economics_settings_versions",
         ])
+
+        draft_columns = self.pg.query(database, """
+            SELECT attname FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid
+             WHERE c.relname='ai_action_drafts' AND attnum > 0 AND NOT attisdropped ORDER BY attname;
+        """)
+        self.assertIn("base_deal_snapshot", draft_columns)
+        self.assertIn("proposal_schema_version", draft_columns)
 
     def test_revisions_and_cash_movements_are_immutable(self):
         database = "p0_immutability"

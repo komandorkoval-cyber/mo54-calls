@@ -8,6 +8,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 from typing import Any, Literal
@@ -21,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from pwdlib import PasswordHash
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from novofon import (
     CALL_API_URL,
@@ -447,6 +448,27 @@ class ActionDraftDecision(BaseModel):
     action: Literal["approve", "reject"]
 
 
+class ReasonCatalogCreate(BaseModel):
+    kind: Literal["lost", "disqualified"]
+    code: str = Field(min_length=1, max_length=100, pattern=r"^[a-z0-9_]+$")
+    label: str = Field(min_length=1, max_length=300)
+
+
+class ReasonCatalogPatch(BaseModel):
+    label: str | None = Field(None, min_length=1, max_length=300)
+    active: bool | None = None
+
+
+AI_DEAL_UPDATE_FIELDS = (
+    "qualification_segment", "estimated_budget_min", "estimated_budget_max", "budget_range",
+    "pain_primary", "pain_secondary", "customer_quote", "decision_makers", "decision_maker_status",
+    "alternative_considered", "alternative_reason", "desired_install_date", "desired_install_period",
+    "next_contact_at", "suggested_stage",
+)
+AI_DEAL_FIELD_BY_PROPOSAL = {"suggested_stage": "stage", **{field: field for field in AI_DEAL_UPDATE_FIELDS if field != "suggested_stage"}}
+AI_NUMERIC_FIELDS = frozenset({"estimated_budget_min", "estimated_budget_max"})
+
+
 class TaskCreate(BaseModel):
     title: str = Field(min_length=1, max_length=300)
     description: str | None = None
@@ -623,6 +645,19 @@ def audit(user: User, entity_type: str, entity_id: str, action: str, before: Any
     )
 
 
+def audit_in_transaction(cursor: Any, user: User, entity_type: str, entity_id: str,
+                         action: str, before: Any, after: Any) -> None:
+    """Keep approval state and its audit event in the same database transaction."""
+
+    cursor.execute(
+        """INSERT INTO audit_log(actor_id, entity_type, entity_id, action, before_data, after_data)
+           VALUES(%s,%s,%s,%s,%s::jsonb,%s::jsonb)""",
+        (user.id, entity_type, entity_id, action,
+         json.dumps(redact_private_data(before), default=str),
+         json.dumps(redact_private_data(after), default=str)),
+    )
+
+
 def require_call_access(call: dict[str, Any], user: User) -> None:
     if user.role == "admin" or str(call.get("owner_id") or "") == str(user.id):
         return
@@ -671,6 +706,106 @@ def deal_stage_transition_allowed(before: dict[str, Any], values: dict[str, Any]
         raise HTTPException(422, "Для disqualified требуется причина дисквалификации")
     if target == "decision_pending" and not (values.get("next_contact_at") or before.get("next_contact_at")):
         raise HTTPException(422, "Для decision_pending требуется дата следующего контакта")
+
+
+def canonical_deal_value(field: str, value: Any) -> Any:
+    """Stable field-level comparison for a draft baseline and current deal row."""
+
+    if value is None:
+        return None
+    if field in AI_NUMERIC_FIELDS:
+        try:
+            return str(Decimal(str(value)).normalize())
+        except (ArithmeticError, ValueError):
+            return value
+    if field == "desired_install_date":
+        return value.isoformat() if isinstance(value, date) else str(value).split("T", 1)[0]
+    if field == "next_contact_at":
+        return value.isoformat() if isinstance(value, datetime) else str(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return value
+
+
+def ai_deal_update_values(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Validate a stored AI proposal and return only approved P0 fields.
+
+    This defence-in-depth check is intentionally independent from the worker's
+    JSON schema: a malformed or manually injected draft cannot mutate a deal.
+    """
+
+    proposed_fields = payload.get("proposed_fields")
+    baseline = payload.get("base_values")
+    if not isinstance(proposed_fields, dict) or not isinstance(baseline, dict):
+        raise HTTPException(422, "AI deal_update draft не содержит проверяемый preview")
+    values: dict[str, Any] = {}
+    for proposal_field in AI_DEAL_UPDATE_FIELDS:
+        proposal = proposed_fields.get(proposal_field)
+        if not isinstance(proposal, dict):
+            raise HTTPException(422, f"AI draft не содержит поле {proposal_field}")
+        status = proposal.get("inference_status")
+        if status not in {"supported", "inferred", "unknown"}:
+            raise HTTPException(422, f"Некорректный inference_status для {proposal_field}")
+        value = proposal.get("proposed_value")
+        if status == "unknown":
+            continue
+        if value is None or value == [] or value == "unknown":
+            raise HTTPException(422, f"Неподтверждённое значение для {proposal_field}")
+        confidence = proposal.get("confidence")
+        evidence = proposal.get("evidence")
+        if not isinstance(confidence, (float, int)) or not 0 <= confidence <= 1:
+            raise HTTPException(422, f"Некорректная confidence для {proposal_field}")
+        if not isinstance(evidence, list) or not evidence:
+            raise HTTPException(422, f"Нет evidence для {proposal_field}")
+        for item in evidence:
+            if not isinstance(item, dict) or not item.get("quote") or (
+                item.get("segment_start_ms") is None and item.get("segment_end_ms") is None
+            ):
+                raise HTTPException(422, f"Evidence для {proposal_field} не привязано к сегменту")
+        values[AI_DEAL_FIELD_BY_PROPOSAL[proposal_field]] = value
+    if not values:
+        raise HTTPException(422, "AI draft не содержит подтверждённых полей сделки")
+    try:
+        values = DealPatch(**values).model_dump(exclude_unset=True)
+    except ValidationError as exc:
+        raise HTTPException(422, f"Некорректные поля AI draft: {exc.errors()[0]['loc'][0]}") from exc
+    return values, proposed_fields, baseline
+
+
+def ai_deal_update_conflicts(current: dict[str, Any], values: dict[str, Any], baseline: dict[str, Any]) -> list[str]:
+    """Return fields changed by a person after the AI draft was prepared."""
+
+    conflicts: list[str] = []
+    for deal_field, proposed in values.items():
+        if deal_field not in baseline:
+            conflicts.append(deal_field)
+            continue
+        previous = canonical_deal_value(deal_field, baseline[deal_field])
+        current_value = canonical_deal_value(deal_field, current.get(deal_field))
+        proposed_value = canonical_deal_value(deal_field, proposed)
+        if current_value != previous and current_value != proposed_value:
+            conflicts.append(deal_field)
+    return conflicts
+
+
+def validate_transition_reason_catalog(cursor: Any, before: dict[str, Any], values: dict[str, Any]) -> None:
+    """An archived reason remains visible historically but cannot be newly selected."""
+
+    target = semantic_funnel_stage(values["stage"]) if "stage" in values else semantic_funnel_stage(str(before["stage"]))
+    checks: list[tuple[str, str | None]] = []
+    if target == "closed_lost" and "stage" in values and target != semantic_funnel_stage(str(before["stage"])):
+        checks.append(("lost", values.get("loss_reason") or before.get("loss_reason")))
+    if target == "disqualified" and "stage" in values and target != semantic_funnel_stage(str(before["stage"])):
+        checks.append(("disqualified", values.get("disqualification_reason") or before.get("disqualification_reason")))
+    if "loss_reason" in values:
+        checks.append(("lost", values["loss_reason"]))
+    if "disqualification_reason" in values:
+        checks.append(("disqualified", values["disqualification_reason"]))
+    for kind, code in checks:
+        cursor.execute("SELECT active FROM deal_reason_catalog WHERE kind=%s AND code=%s", (kind, code))
+        reason = cursor.fetchone()
+        if not reason or not reason["active"]:
+            raise HTTPException(422, "Причина неактивна или отсутствует в справочнике")
 
 
 def enforce_price_floor_override(cursor: Any, deal_id: UUID, values: dict[str, Any], user: User) -> None:
@@ -1002,6 +1137,11 @@ def get_call(call_id: int, user: User = Depends(current_user)):
         "SELECT *, status::text AS status FROM tasks WHERE call_id=%s ORDER BY due_at NULLS LAST",
         (call_id,),
     )
+    call["action_drafts"] = fetch_all(
+        """SELECT id,kind,status,target_deal_id,payload,evidence,created_at,reviewed_at
+           FROM ai_action_drafts WHERE call_id=%s ORDER BY created_at DESC""",
+        (call_id,),
+    )
     call["automation"] = {
         "transcript": "unavailable" if call["source"] == "novofon" and not call["transcript"] else "ready" if call["transcript"] else "waiting",
         "analysis": "unavailable" if call["source"] == "novofon" and not call["transcript"] else "ready" if call["insight"] else "waiting",
@@ -1071,12 +1211,48 @@ def retry_call(call_id: int, stage: Literal["transcribe", "analyze"] = "transcri
     return {"queued": True}
 
 
+@app.get("/api/action-drafts/{draft_id}/preview")
+def action_draft_preview(draft_id: UUID, user: User = Depends(current_user)):
+    draft = fetch_one(
+        """SELECT d.*,c.contact_id,c.owner_id FROM ai_action_drafts d
+           JOIN calls c ON c.id=d.call_id WHERE d.id=%s""", (draft_id,)
+    )
+    if not draft:
+        raise HTTPException(404, "AI draft не найден")
+    require_call_access(draft, user)
+    preview: dict[str, Any] = {"draft": draft, "diff": [], "stale": False, "conflicts": []}
+    if draft["kind"] != "deal_update":
+        return preview
+    target = require_deal_access(fetch_one("SELECT * FROM deals WHERE id=%s", (draft["target_deal_id"],)), user)
+    payload = dict(draft["payload"] or {})
+    payload["base_values"] = draft.get("base_deal_snapshot") or payload.get("base_values")
+    values, proposed_fields, baseline = ai_deal_update_values(payload)
+    conflicts = ai_deal_update_conflicts(target, values, baseline)
+    preview["target_deal"] = target
+    preview["stale"] = bool(conflicts)
+    preview["conflicts"] = conflicts
+    for proposal_field in AI_DEAL_UPDATE_FIELDS:
+        deal_field = AI_DEAL_FIELD_BY_PROPOSAL[proposal_field]
+        if deal_field not in values:
+            continue
+        proposal = proposed_fields[proposal_field]
+        preview["diff"].append({
+            "field": proposal_field,
+            "current_value": target.get(deal_field),
+            "proposed_value": values[deal_field],
+            "confidence": proposal.get("confidence"),
+            "evidence": proposal.get("evidence", []),
+            "inference_status": proposal.get("inference_status"),
+            "conflict": deal_field in conflicts,
+        })
+    return preview
+
+
 @app.post("/api/action-drafts/{draft_id}/decision")
 def decide_action_draft(draft_id: UUID, body: ActionDraftDecision, user: User = Depends(current_user)):
     """Apply exactly one manually approved AI proposal under a row lock."""
 
     with pool.connection() as conn, conn.cursor() as cur:
-        enforce_price_floor_override(cur, deal_id, values, user)
         cur.execute(
             """SELECT d.*,c.contact_id,c.owner_id FROM ai_action_drafts d
                JOIN calls c ON c.id=d.call_id WHERE d.id=%s FOR UPDATE""", (draft_id,)
@@ -1093,11 +1269,12 @@ def decide_action_draft(draft_id: UUID, body: ActionDraftDecision, user: User = 
                    WHERE id=%s RETURNING *""", (user.id, draft_id)
             )
             result = cur.fetchone()
+            audit_in_transaction(cur, user, "ai_action_draft", str(draft_id), "reject",
+                                 {"status": "pending"}, {"status": "rejected"})
             conn.commit()
-            audit(user, "ai_action_draft", str(draft_id), "reject", {"status": "pending"}, {"status": "rejected"})
             return result
 
-        payload = draft["payload"] or {}
+        payload = dict(draft["payload"] or {})
         entity_type = entity_id = None
         if draft["kind"] == "task_create":
             cur.execute(
@@ -1112,10 +1289,10 @@ def decide_action_draft(draft_id: UUID, body: ActionDraftDecision, user: User = 
             stage = payload.get("stage") or "new_lead"
             semantic_funnel_stage(stage)
             cur.execute(
-                """INSERT INTO deals(contact_id,owner_id,title,stage,amount,quoted_price,qualification_segment)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                (draft["contact_id"], user.id, payload["title"], stage, payload.get("amount"),
-                 payload.get("quoted_price"), payload.get("qualification_segment") or "unknown"),
+                """INSERT INTO deals(contact_id,owner_id,title,stage,qualification_segment)
+                   VALUES(%s,%s,%s,%s,%s) RETURNING id""",
+                (draft["contact_id"], user.id, payload["title"], stage,
+                 payload.get("qualification_segment") or "unknown"),
             )
             entity_id, entity_type = str(cur.fetchone()["id"]), "deal"
             cur.execute("INSERT INTO call_deals(call_id,deal_id) VALUES(%s,%s) ON CONFLICT DO NOTHING", (draft["call_id"], entity_id))
@@ -1127,17 +1304,25 @@ def decide_action_draft(draft_id: UUID, body: ActionDraftDecision, user: User = 
             )
             entity_id, entity_type = str(cur.fetchone()["id"]), "contact"
         elif draft["kind"] == "deal_update":
-            target = fetch_one("SELECT * FROM deals WHERE id=%s", (draft["target_deal_id"],))
+            if not draft["target_deal_id"]:
+                raise HTTPException(422, "AI deal_update draft не содержит целевую сделку")
+            cur.execute(
+                """SELECT d.*,d.stage::text AS stage FROM deals d JOIN calls c ON c.id=%s
+                   WHERE d.id=%s AND d.contact_id=c.contact_id FOR UPDATE""",
+                (draft["call_id"], draft["target_deal_id"]),
+            )
+            target = cur.fetchone()
+            if not target:
+                raise HTTPException(422, "Целевая сделка не связана с контактом звонка")
             require_deal_access(target, user)
-            allowed = {"stage", "qualification_segment", "qualification_status", "qualification_reason",
-                       "estimated_budget_min", "estimated_budget_max", "budget_range", "decision_makers",
-                       "decision_maker_status", "pain_primary", "pain_secondary", "customer_quote",
-                       "customer_quote_evidence", "alternative_considered", "urgency_reason", "next_contact_at"}
-            values = {key: value for key, value in payload.items() if key in allowed}
-            if not values:
-                raise HTTPException(422, "AI draft не содержит разрешённых полей сделки")
+            payload["base_values"] = draft.get("base_deal_snapshot") or payload.get("base_values")
+            values, _proposed_fields, baseline = ai_deal_update_values(payload)
+            conflicts = ai_deal_update_conflicts(target, values, baseline)
+            if conflicts:
+                raise HTTPException(409, {"detail": "AI draft устарел", "conflicts": conflicts})
             deal_stage_transition_allowed(target, values)
-            for key in ("decision_makers", "pain_secondary", "customer_quote_evidence"):
+            validate_transition_reason_catalog(cur, target, values)
+            for key in ("decision_makers", "pain_secondary"):
                 if key in values:
                     values[key] = json.dumps(values[key], ensure_ascii=False)
             cur.execute(
@@ -1156,9 +1341,9 @@ def decide_action_draft(draft_id: UUID, body: ActionDraftDecision, user: User = 
             (user.id, entity_type, entity_id, draft_id),
         )
         result = cur.fetchone()
+        audit_in_transaction(cur, user, "ai_action_draft", str(draft_id), "approve", {"status": "pending"},
+                             {"status": "approved", "entity_type": entity_type, "entity_id": entity_id})
         conn.commit()
-    audit(user, "ai_action_draft", str(draft_id), "approve", {"status": "pending"},
-          {"status": "approved", "entity_type": entity_type, "entity_id": entity_id})
     return result
 
 
@@ -1382,11 +1567,16 @@ def patch_deal(deal_id: UUID, body: DealPatch, user: User = Depends(current_user
     values = body.model_dump(exclude_unset=True)
     if not values:
         return before
-    deal_stage_transition_allowed(before, values)
-    for json_key in ("decision_makers", "pain_secondary", "customer_quote_evidence"):
-        if json_key in values:
-            values[json_key] = json.dumps(values[json_key], ensure_ascii=False)
     with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT *,stage::text AS stage FROM deals WHERE id=%s FOR UPDATE", (deal_id,))
+        locked_before = cur.fetchone()
+        require_deal_access(locked_before, user)
+        deal_stage_transition_allowed(locked_before, values)
+        validate_transition_reason_catalog(cur, locked_before, values)
+        enforce_price_floor_override(cur, deal_id, values, user)
+        for json_key in ("decision_makers", "pain_secondary", "customer_quote_evidence"):
+            if json_key in values:
+                values[json_key] = json.dumps(values[json_key], ensure_ascii=False)
         assignments = [f"{key}=%s" for key in values]
         cur.execute(
             f"UPDATE deals SET {','.join(assignments)},updated_at=now() WHERE id=%s RETURNING *,stage::text AS stage",
@@ -1396,7 +1586,7 @@ def patch_deal(deal_id: UUID, body: DealPatch, user: User = Depends(current_user
         if "stage" in values:
             recognize_income_for_stage(cur, deal_id, after["stage"], user.id)
         conn.commit()
-    audit(user, "deal", str(deal_id), "update", before, after)
+    audit(user, "deal", str(deal_id), "update", locked_before, after)
     return after
 
 
@@ -1415,6 +1605,16 @@ def deals(user: User = Depends(current_user)):
 def deal_detail(deal_id: UUID, user: User = Depends(current_user)):
     deal = require_deal_access(fetch_one("SELECT d.*,d.stage::text AS stage FROM deals d WHERE id=%s", (deal_id,)), user)
     deal["economics_revisions"] = fetch_all("SELECT * FROM deal_economics_revisions WHERE deal_id=%s ORDER BY revision DESC", (deal_id,))
+    if deal.get("loss_reason"):
+        deal["loss_reason_catalog"] = fetch_one(
+            "SELECT id,kind,code,label,active FROM deal_reason_catalog WHERE kind='lost' AND code=%s",
+            (deal["loss_reason"],),
+        )
+    if deal.get("disqualification_reason"):
+        deal["disqualification_reason_catalog"] = fetch_one(
+            "SELECT id,kind,code,label,active FROM deal_reason_catalog WHERE kind='disqualified' AND code=%s",
+            (deal["disqualification_reason"],),
+        )
     return deal
 
 
@@ -1440,6 +1640,45 @@ def create_economics_revision(deal_id: UUID, body: EconomicsRevisionCreate, user
         conn.commit()
     audit(user, "deal_economics_revision", str(revision_id), "create", None,
           {"deal_id": str(deal_id), "revision": row["revision"], "status": result.economics_status})
+    return row
+
+
+@app.get("/api/deal-reasons")
+def active_deal_reasons(user: User = Depends(current_user)):
+    return fetch_all(
+        "SELECT id,kind,code,label,active FROM deal_reason_catalog WHERE active ORDER BY kind,label"
+    )
+
+
+@app.get("/api/admin/deal-reasons")
+def admin_deal_reasons(user: User = Depends(require_admin)):
+    return fetch_all("SELECT * FROM deal_reason_catalog ORDER BY kind,active DESC,label")
+
+
+@app.post("/api/admin/deal-reasons")
+def create_deal_reason(body: ReasonCatalogCreate, user: User = Depends(require_admin)):
+    row = execute(
+        """INSERT INTO deal_reason_catalog(kind,code,label,active)
+           VALUES(%s,%s,%s,true) RETURNING *""", (body.kind, body.code, body.label),
+    )
+    audit(user, "deal_reason_catalog", str(row["id"]), "create", None, row)
+    return row
+
+
+@app.patch("/api/admin/deal-reasons/{reason_id}")
+def update_deal_reason(reason_id: UUID, body: ReasonCatalogPatch, user: User = Depends(require_admin)):
+    before = fetch_one("SELECT * FROM deal_reason_catalog WHERE id=%s", (reason_id,))
+    if not before:
+        raise HTTPException(404, "Причина не найдена")
+    values = body.model_dump(exclude_unset=True)
+    if not values:
+        return before
+    row = execute(
+        f"UPDATE deal_reason_catalog SET {','.join(f'{key}=%s' for key in values)},updated_at=now() WHERE id=%s RETURNING *",
+        tuple(values.values()) + (reason_id,),
+    )
+    action = "disable" if values.get("active") is False else "update"
+    audit(user, "deal_reason_catalog", str(reason_id), action, before, row)
     return row
 
 
