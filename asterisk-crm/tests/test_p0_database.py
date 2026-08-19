@@ -25,6 +25,10 @@ P0_BEFORE_010 = [
     SQL / "009_p0_cashflow_ledger.sql",
 ]
 P0_010 = SQL / "010_p0_ai_proposals_audit.sql"
+P0_AFTER_010 = [
+    SQL / "011_p0_price_floor_override.sql",
+    SQL / "012_p0_cash_movement_reversals.sql",
+]
 
 
 class PostgresHarness:
@@ -87,6 +91,12 @@ class P0DatabaseMigrationTests(unittest.TestCase):
         for path in [*BASE, *P0_BEFORE_010]:
             self.pg.execute_file(database, path)
 
+    def apply_final_p0(self, database: str):
+        self.apply_core_and_p0(database)
+        self.pg.execute_file(database, P0_010)
+        for path in P0_AFTER_010:
+            self.pg.execute_file(database, path)
+
     def ai_schema_signature(self, database: str) -> list[str]:
         return self.pg.query(database, """
             SELECT 'column|' || a.attname || '|' || pg_catalog.format_type(a.atttypid, a.atttypmod)
@@ -119,9 +129,8 @@ class P0DatabaseMigrationTests(unittest.TestCase):
 
     def test_full_p0_migration_set_replays_on_a_clean_database(self):
         database = "p0_full_replay"
-        self.apply_core_and_p0(database)
-        self.pg.execute_file(database, P0_010)
-        for path in [*BASE, *P0_BEFORE_010, P0_010]:
+        self.apply_final_p0(database)
+        for path in [*BASE, *P0_BEFORE_010, P0_010, *P0_AFTER_010]:
             self.pg.execute_file(database, path)
         tables = self.pg.query(database, """
             SELECT tablename FROM pg_tables WHERE schemaname='public'
@@ -136,8 +145,7 @@ class P0DatabaseMigrationTests(unittest.TestCase):
 
     def test_revisions_and_cash_movements_are_immutable(self):
         database = "p0_immutability"
-        self.apply_core_and_p0(database)
-        self.pg.execute_file(database, P0_010)
+        self.apply_final_p0(database)
         self.pg.sql(database, """
             INSERT INTO crm_users(email,display_name,password_hash) VALUES('test@example.com','Test','x');
             INSERT INTO contacts(phone_normalized) VALUES('+79990000000');
@@ -165,7 +173,7 @@ class P0DatabaseMigrationTests(unittest.TestCase):
 
     def test_safe_cash_components_keep_realized_and_open_costs_separate(self):
         database = "p0_cashflow"
-        self.apply_core_and_p0(database)
+        self.apply_final_p0(database)
         self.pg.sql(database, """
             INSERT INTO contacts(phone_normalized) VALUES('+79990000001');
             INSERT INTO deals(contact_id,title) SELECT id,'Cashflow terrace' FROM contacts LIMIT 1;
@@ -205,7 +213,7 @@ class P0DatabaseMigrationTests(unittest.TestCase):
 
     def test_income_recognition_is_single_and_defaults_to_installed(self):
         database = "p0_recognition"
-        self.apply_core_and_p0(database)
+        self.apply_final_p0(database)
         self.pg.sql(database, """
             INSERT INTO contacts(phone_normalized) VALUES('+79990000002');
             INSERT INTO deals(contact_id,title) SELECT id,'Recognition terrace' FROM contacts LIMIT 1;
@@ -225,6 +233,76 @@ class P0DatabaseMigrationTests(unittest.TestCase):
         """)
         self.assertEqual(self.pg.query(database, "SELECT income_recognition_stage FROM economics_settings_versions WHERE version=1;"), ["installed"])
         self.assertEqual(self.pg.query(database, "SELECT recognized_owner_income::text FROM deal_income_recognitions;"), ["25000.00"])
+
+    def test_settlement_replaces_open_reservation_with_immutable_realized_cost(self):
+        database = "p0_settlement"
+        self.apply_final_p0(database)
+        self.pg.sql(database, """
+            INSERT INTO contacts(phone_normalized) VALUES('+79990000003');
+            INSERT INTO deals(contact_id,title) SELECT id,'Settlement terrace' FROM contacts LIMIT 1;
+            INSERT INTO deal_cash_movements(deal_id,kind,amount,confirmed_at)
+              SELECT id,'customer_incoming',150000,now() FROM deals LIMIT 1;
+            INSERT INTO deal_cost_obligations(deal_id,amount,status)
+              SELECT id,60000,'open' FROM deals LIMIT 1;
+        """)
+        before = self.pg.query(database, """
+            SELECT coalesce(sum(m.amount) FILTER (WHERE m.kind='customer_incoming'),0)
+              - coalesce(sum(o.amount) FILTER (WHERE o.status='open'),0)
+            FROM deals d LEFT JOIN deal_cash_movements m ON m.deal_id=d.id
+            LEFT JOIN deal_cost_obligations o ON o.deal_id=d.id GROUP BY d.id;
+        """)
+        self.assertEqual(before, ["90000.00"])
+        self.pg.sql(database, """
+            WITH posted AS (
+              INSERT INTO deal_cash_movements(deal_id,obligation_id,kind,amount,confirmed_at)
+                SELECT o.deal_id,o.id,'realized_cost_outflow',o.amount,now()
+                  FROM deal_cost_obligations o WHERE o.status='open'
+                RETURNING id,obligation_id
+            )
+            UPDATE deal_cost_obligations o
+               SET status='settled',settled_at=now(),settled_movement_id=posted.id
+              FROM posted WHERE o.id=posted.obligation_id;
+        """)
+        after = self.pg.query(database, """
+            WITH m AS (SELECT deal_id,
+              coalesce(sum(amount) FILTER (WHERE kind='customer_incoming'),0) AS incoming,
+              coalesce(sum(amount) FILTER (WHERE kind='realized_cost_outflow'),0) AS realized
+              FROM deal_cash_movements GROUP BY deal_id),
+            o AS (SELECT deal_id,coalesce(sum(amount) FILTER (WHERE status='open'),0) AS open_cost
+              FROM deal_cost_obligations GROUP BY deal_id)
+            SELECT m.incoming || '|' || m.realized || '|' || o.open_cost || '|' || (m.incoming-m.realized-o.open_cost)
+              FROM m JOIN o USING(deal_id);
+        """)
+        self.assertEqual(after, ["150000.00|60000.00|0|90000.00"])
+        self.assertEqual(self.pg.query(database, """
+            SELECT status || '|' || (settled_movement_id IS NOT NULL)::text FROM deal_cost_obligations;
+        """), ["settled|true"])
+
+    def test_reversal_is_another_row_and_cannot_mutate_the_original_movement(self):
+        database = "p0_reversal"
+        self.apply_final_p0(database)
+        self.pg.sql(database, """
+            INSERT INTO contacts(phone_normalized) VALUES('+79990000004');
+            INSERT INTO deals(contact_id,title) SELECT id,'Reversal terrace' FROM contacts LIMIT 1;
+            WITH original AS (
+              INSERT INTO deal_cash_movements(deal_id,kind,amount,confirmed_at)
+                SELECT id,'customer_incoming',150000,now() FROM deals LIMIT 1 RETURNING id
+            )
+            INSERT INTO deal_cash_movements(deal_id,reversal_of_movement_id,kind,amount,confirmed_at)
+              SELECT d.id,original.id,'customer_refund',150000,now() FROM deals d CROSS JOIN original;
+        """)
+        rows = self.pg.query(database, """
+            SELECT kind || '|' || amount::text || '|' || (reversal_of_movement_id IS NOT NULL)::text
+              FROM deal_cash_movements ORDER BY created_at,kind;
+        """)
+        self.assertEqual(rows, ["customer_incoming|150000.00|false", "customer_refund|150000.00|true"])
+        mutation = subprocess.run(
+            ["docker", "exec", "-i", self.pg.container, "psql", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database],
+            input="UPDATE deal_cash_movements SET amount=1 WHERE kind='customer_incoming';",
+            text=True, encoding="utf-8", capture_output=True,
+        )
+        self.assertNotEqual(mutation.returncode, 0)
+        self.assertIn("append-only", mutation.stderr)
 
 
 if __name__ == "__main__":

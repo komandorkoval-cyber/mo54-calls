@@ -16,6 +16,7 @@ from p0_services import (  # noqa: E402
     calculate_safe_cash,
     recognize_income_for_stage,
     semantic_funnel_stage,
+    settle_cost_obligation,
 )
 
 
@@ -77,6 +78,55 @@ class FunnelAndEconomicsTests(unittest.TestCase):
         self.assertEqual(totals.open_reserved_obligations, Decimal("40.00"))
         self.assertEqual(totals.other_reserved_cash, Decimal("15.00"))
         self.assertEqual(totals.safe_cash, Decimal("40.00"))
+
+    def test_compensating_movement_corrects_balance_without_changing_original(self):
+        movements = [
+            {"kind": "customer_incoming", "amount": "150000.00"},
+            {"kind": "customer_refund", "amount": "150000.00", "reversal_of_movement_id": "original"},
+        ]
+        snapshot = [dict(row) for row in movements]
+        totals = calculate_safe_cash(movements, [])
+        self.assertEqual(totals.net_confirmed_customer_cash, Decimal("0.00"))
+        self.assertEqual(totals.safe_cash, Decimal("0.00"))
+        self.assertEqual(movements, snapshot)
+
+
+class SettlementCursor:
+    """Records the two immutable writes made by an obligation settlement."""
+
+    def __init__(self):
+        self.obligation_id = uuid4()
+        self.deal_id = uuid4()
+        self.movement_id = uuid4()
+        self.queries: list[tuple[str, tuple]] = []
+
+    def execute(self, sql: str, params: tuple = ()):
+        self.queries.append((sql, params))
+
+    def fetchone(self):
+        query = self.queries[-1][0]
+        if "SELECT id,deal_id,amount,status" in query:
+            return (self.obligation_id, self.deal_id, Decimal("60000.00"), "open")
+        if "INSERT INTO deal_cash_movements" in query:
+            return (self.movement_id,)
+        raise AssertionError(query)
+
+
+class CashflowSettlementTests(unittest.TestCase):
+    def test_settlement_posts_realized_cost_then_removes_only_open_reservation(self):
+        cursor = SettlementCursor()
+        movement_id = settle_cost_obligation(
+            cursor, cursor.obligation_id, occurred_at="occurred", confirmed_at="confirmed", actor_id=uuid4()
+        )
+        self.assertEqual(movement_id, cursor.movement_id)
+        insert = next((params for sql, params in cursor.queries if "INSERT INTO deal_cash_movements" in sql), None)
+        update = next((params for sql, params in cursor.queries if "UPDATE deal_cost_obligations" in sql), None)
+        self.assertIsNotNone(insert)
+        self.assertEqual(insert[0], cursor.deal_id)
+        self.assertEqual(insert[1], cursor.obligation_id)
+        self.assertEqual(insert[2], Decimal("60000.00"))
+        self.assertEqual(update[1], cursor.movement_id)
+        self.assertEqual(update[2], cursor.obligation_id)
 
 
 class RecognitionCursor:

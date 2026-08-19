@@ -7,7 +7,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 from typing import Any, Literal
@@ -427,10 +427,20 @@ class CashMovementCreate(BaseModel):
     note: str | None = Field(None, max_length=2000)
 
 
+class CashMovementReverse(BaseModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+
 class CostObligationCreate(BaseModel):
     amount: float = Field(gt=0)
     description: str | None = Field(None, max_length=2000)
-    due_date: datetime | None = None
+    due_date: date | None = None
+
+
+class CostObligationPatch(BaseModel):
+    amount: float | None = Field(None, gt=0)
+    description: str | None = Field(None, max_length=2000)
+    due_date: date | None = None
 
 
 class ActionDraftDecision(BaseModel):
@@ -1482,6 +1492,41 @@ def create_cash_movement(deal_id: UUID, body: CashMovementCreate, user: User = D
     return row
 
 
+@app.post("/api/deals/{deal_id}/cash-movements/{movement_id}/reverse")
+def reverse_cash_movement(deal_id: UUID, movement_id: UUID, body: CashMovementReverse,
+                          user: User = Depends(current_user)):
+    require_deal_access(fetch_one("SELECT id,owner_id FROM deals WHERE id=%s", (deal_id,)), user)
+    original = fetch_one(
+        "SELECT * FROM deal_cash_movements WHERE id=%s AND deal_id=%s", (movement_id, deal_id)
+    )
+    if not original:
+        raise HTTPException(404, "Денежное движение не найдено")
+    reversal_kind = {
+        "customer_incoming": "customer_refund",
+        "customer_refund": "customer_incoming",
+        "realized_cost_outflow": "realized_cost_outflow_reversal",
+        "realized_cost_outflow_reversal": "realized_cost_outflow",
+        "other_reserved_cash": "other_reserved_cash_release",
+        "other_reserved_cash_release": "other_reserved_cash",
+    }.get(original["kind"])
+    if not reversal_kind:
+        raise HTTPException(409, "Для этого движения нельзя создать компенсацию")
+    row = execute(
+        """INSERT INTO deal_cash_movements(
+               deal_id,reversal_of_movement_id,kind,amount,occurred_at,confirmed_at,note,created_by
+           ) VALUES(%s,%s,%s,%s,now(),now(),%s,%s)
+           ON CONFLICT (reversal_of_movement_id) WHERE reversal_of_movement_id IS NOT NULL DO NOTHING
+           RETURNING *""",
+        (deal_id, movement_id, reversal_kind, original["amount"], body.reason, user.id),
+    )
+    if not row:
+        raise HTTPException(409, "Компенсирующее движение уже создано")
+    audit(user, "deal_cash_movement", str(row["id"]), "reverse",
+          {"id": str(movement_id), "kind": original["kind"], "amount": original["amount"]},
+          {"reversal_of_movement_id": str(movement_id), "kind": reversal_kind, "amount": original["amount"]})
+    return row
+
+
 @app.get("/api/deals/{deal_id}/cashflow")
 def deal_cashflow(deal_id: UUID, user: User = Depends(current_user)):
     require_deal_access(fetch_one("SELECT id,owner_id FROM deals WHERE id=%s", (deal_id,)), user)
@@ -1490,11 +1535,15 @@ def deal_cashflow(deal_id: UUID, user: User = Depends(current_user)):
     incoming = sum((row["amount"] for row in movements if row["kind"] == "customer_incoming"), 0)
     refunds = sum((row["amount"] for row in movements if row["kind"] == "customer_refund"), 0)
     realized = sum((row["amount"] for row in movements if row["kind"] == "realized_cost_outflow"), 0)
+    realized_reversals = sum((row["amount"] for row in movements if row["kind"] == "realized_cost_outflow_reversal"), 0)
+    other_reserves = sum((row["amount"] for row in movements if row["kind"] == "other_reserved_cash"), 0)
+    other_reserve_releases = sum((row["amount"] for row in movements if row["kind"] == "other_reserved_cash_release"), 0)
     reserves = sum((row["amount"] for row in obligations if row["status"] == "open"), 0)
     return {"movements": movements, "obligations": obligations, "confirmed_customer_cash": incoming,
             "refunds": refunds, "net_confirmed_customer_cash": incoming-refunds,
-            "realized_costs": realized, "open_obligations": reserves,
-            "safe_cash": incoming-refunds-realized-reserves}
+            "realized_costs": realized-realized_reversals, "open_obligations": reserves,
+            "other_reserved_cash": other_reserves-other_reserve_releases,
+            "safe_cash": incoming-refunds-(realized-realized_reversals)-reserves-(other_reserves-other_reserve_releases)}
 
 
 @app.post("/api/deals/{deal_id}/cost-obligations")
@@ -1510,6 +1559,35 @@ def create_cost_obligation(deal_id: UUID, body: CostObligationCreate, user: User
     return row
 
 
+@app.patch("/api/deals/{deal_id}/cost-obligations/{obligation_id}")
+def update_open_cost_obligation(deal_id: UUID, obligation_id: UUID, body: CostObligationPatch,
+                                user: User = Depends(current_user)):
+    require_deal_access(fetch_one("SELECT id,owner_id FROM deals WHERE id=%s", (deal_id,)), user)
+    before = fetch_one("SELECT * FROM deal_cost_obligations WHERE id=%s AND deal_id=%s", (obligation_id, deal_id))
+    if not before:
+        raise HTTPException(404, "Обязательство не найдено")
+    if before["status"] != "open":
+        raise HTTPException(409, "Можно редактировать только открытое обязательство")
+    values = body.model_dump(exclude_unset=True)
+    if not values:
+        return before
+    assignments = []
+    params: list[Any] = []
+    for column in ("amount", "description", "due_date"):
+        if column in values:
+            assignments.append(f"{column}=%s")
+            params.append(values[column])
+    row = execute(
+        f"""UPDATE deal_cost_obligations SET {','.join(assignments)},updated_at=now()
+            WHERE id=%s AND deal_id=%s AND status='open' RETURNING *""",
+        tuple([*params, obligation_id, deal_id]),
+    )
+    if not row:
+        raise HTTPException(409, "Обязательство уже урегулировано или закрыто")
+    audit(user, "deal_cost_obligation", str(obligation_id), "update", before, row)
+    return row
+
+
 @app.post("/api/deals/{deal_id}/cost-obligations/{obligation_id}/settle")
 def settle_obligation(deal_id: UUID, obligation_id: UUID, user: User = Depends(current_user)):
     require_deal_access(fetch_one("SELECT id,owner_id FROM deals WHERE id=%s", (deal_id,)), user)
@@ -1518,8 +1596,11 @@ def settle_obligation(deal_id: UUID, obligation_id: UUID, user: User = Depends(c
         obligation = cur.fetchone()
         if not obligation or str(obligation["deal_id"]) != str(deal_id):
             raise HTTPException(404, "Обязательство не найдено")
-        movement_id = settle_cost_obligation(cur, obligation_id, occurred_at=datetime.now(timezone.utc),
-                                             confirmed_at=datetime.now(timezone.utc), actor_id=user.id)
+        try:
+            movement_id = settle_cost_obligation(cur, obligation_id, occurred_at=datetime.now(timezone.utc),
+                                                 confirmed_at=datetime.now(timezone.utc), actor_id=user.id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
         cur.execute("SELECT * FROM deal_cash_movements WHERE id=%s", (movement_id,))
         row = cur.fetchone()
         conn.commit()
@@ -1542,11 +1623,13 @@ def season_dashboard(user: User = Depends(current_user)):
           coalesce((SELECT sum(amount) FILTER (WHERE kind='customer_incoming') FROM movements),0)
             - coalesce((SELECT sum(amount) FILTER (WHERE kind='customer_refund') FROM movements),0) AS net_confirmed_customer_cash,
           coalesce((SELECT sum(amount) FILTER (WHERE kind='realized_cost_outflow') FROM movements),0) AS realized_cost_outflows,
+          coalesce((SELECT sum(amount) FILTER (WHERE kind='realized_cost_outflow_reversal') FROM movements),0) AS realized_cost_reversals,
           coalesce((SELECT sum(amount) FILTER (WHERE kind='other_reserved_cash') FROM movements),0)
             - coalesce((SELECT sum(amount) FILTER (WHERE kind='other_reserved_cash_release') FROM movements),0) AS other_reserved_cash,
           coalesce((SELECT sum(amount) FROM obligations WHERE status='open'),0) AS open_reserved_obligations
         FROM scoped_deals
     """, params)
+    row["realized_cost_outflows"] -= row.pop("realized_cost_reversals", 0)
     row["safe_cash"] = (row["net_confirmed_customer_cash"] - row["realized_cost_outflows"]
                          - row["open_reserved_obligations"] - row["other_reserved_cash"])
     row["remaining_to_goal"] = row["goal_owner_income"] - row["earned_owner_income"]

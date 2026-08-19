@@ -215,6 +215,8 @@ def calculate_safe_cash(movements: Iterable[Mapping[str, Any]], obligations: Ite
             refunds += amount
         elif kind == "realized_cost_outflow":
             realized += amount
+        elif kind == "realized_cost_outflow_reversal":
+            realized -= amount
         elif kind == "other_reserved_cash":
             reserves += amount
         elif kind == "other_reserved_cash_release":
