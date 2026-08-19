@@ -381,7 +381,13 @@ class DealPatch(BaseModel):
     customer_quote: str | None = None
     customer_quote_evidence: list[dict[str, Any]] | None = None
     alternative_considered: str | None = None
+    alternative_reason: str | None = None
     urgency_reason: str | None = None
+    desired_install_date: datetime | None = None
+    desired_install_period: str | None = None
+    photos_received: bool | None = None
+    measurements_received: bool | None = None
+    price_floor_override_reason: str | None = Field(None, min_length=3, max_length=2000)
     quoted_price: float | None = Field(None, ge=0)
     final_contract_price: float | None = Field(None, ge=0)
     installation_mode: Literal["solo", "with_partner", "external_team", "unknown"] | None = None
@@ -655,6 +661,19 @@ def deal_stage_transition_allowed(before: dict[str, Any], values: dict[str, Any]
         raise HTTPException(422, "Для disqualified требуется причина дисквалификации")
     if target == "decision_pending" and not (values.get("next_contact_at") or before.get("next_contact_at")):
         raise HTTPException(422, "Для decision_pending требуется дата следующего контакта")
+
+
+def enforce_price_floor_override(cursor: Any, deal_id: UUID, values: dict[str, Any], user: User) -> None:
+    if "quoted_price" not in values:
+        return
+    cursor.execute("SELECT price_floor_ae_8 FROM deal_economics_revisions WHERE id=(SELECT current_economics_revision_id FROM deals WHERE id=%s)", (deal_id,))
+    floor = cursor.fetchone()
+    if floor and floor["price_floor_ae_8"] is not None and values["quoted_price"] < float(floor["price_floor_ae_8"]):
+        reason = values.get("price_floor_override_reason")
+        if not reason:
+            raise HTTPException(422, "Цена ниже финансового пола AE 8%: укажите причину override")
+        values["price_floor_overridden_at"] = datetime.now(timezone.utc)
+        values["price_floor_overridden_by"] = user.id
 
 
 def current_economics_settings(cursor: Any) -> EconomicsSettings:
@@ -1047,6 +1066,7 @@ def decide_action_draft(draft_id: UUID, body: ActionDraftDecision, user: User = 
     """Apply exactly one manually approved AI proposal under a row lock."""
 
     with pool.connection() as conn, conn.cursor() as cur:
+        enforce_price_floor_override(cur, deal_id, values, user)
         cur.execute(
             """SELECT d.*,c.contact_id,c.owner_id FROM ai_action_drafts d
                JOIN calls c ON c.id=d.call_id WHERE d.id=%s FOR UPDATE""", (draft_id,)
@@ -1379,6 +1399,13 @@ def deals(user: User = Depends(current_user)):
            LEFT JOIN deal_economics_revisions er ON er.id=d.current_economics_revision_id""" + ("" if user.role == "admin" else " WHERE d.owner_id=%s") + " ORDER BY d.updated_at DESC",
         () if user.role == "admin" else (user.id,),
     )
+
+
+@app.get("/api/deals/{deal_id}")
+def deal_detail(deal_id: UUID, user: User = Depends(current_user)):
+    deal = require_deal_access(fetch_one("SELECT d.*,d.stage::text AS stage FROM deals d WHERE id=%s", (deal_id,)), user)
+    deal["economics_revisions"] = fetch_all("SELECT * FROM deal_economics_revisions WHERE deal_id=%s ORDER BY revision DESC", (deal_id,))
+    return deal
 
 
 @app.get("/api/deals/{deal_id}/economics/revisions")
