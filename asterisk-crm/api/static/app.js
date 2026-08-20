@@ -192,9 +192,7 @@ document.addEventListener('click', event => {
   if (action === 'navigate') navigate(control.dataset.view);
   if (action === 'call-detail' && Number.isSafeInteger(numericId) && numericId > 0) callDetail(numericId);
   if (action === 'contact-detail' && control.dataset.contactId) contactDetail(control.dataset.contactId);
-  if (action === 'deal-detail' && control.dataset.dealId) {
-    dealDetail(control.dataset.dealId).catch(error => toast(`Не удалось открыть сделку: ${error.message}`));
-  }
+  if (action === 'deal-detail' && control.dataset.dealId) openDeal(control.dataset.dealId);
   if (action === 'complete-task' && control.dataset.taskId) completeTask(control.dataset.taskId);
   if (action === 'retry-call' && Number.isSafeInteger(numericId) && numericId > 0 && control.dataset.stage) {
     retryCall(numericId, control.dataset.stage);
@@ -203,6 +201,20 @@ document.addEventListener('click', event => {
     decideActionDraft(numericId, control.dataset.draftId, control.dataset.decision);
   }
 });
+
+function openDeal(id) {
+  dealDetail(id).catch(error => toast(`Не удалось открыть сделку: ${error.message}`));
+}
+
+function bindDealOpeners(root = document) {
+  root.querySelectorAll('[data-action="deal-detail"][data-deal-id]').forEach(control => {
+    control.onclick = event => {
+      event.preventDefault();
+      event.stopPropagation();
+      openDeal(control.dataset.dealId);
+    };
+  });
+}
 
 function setHead(title, eyebrow = 'РАБОЧЕЕ ПРОСТРАНСТВО') {
   $('#title').textContent = title;
@@ -587,6 +599,7 @@ async function contactDetail(id) {
 
   const callbackButton = $('#callback-button');
   if (phone && callbackButton) callbackButton.onclick = () => initiateCall(contact);
+  bindDealOpeners($('#content'));
 }
 
 async function deals() {
@@ -595,6 +608,7 @@ async function deals() {
   $('#content').innerHTML = rows.length
     ? `<table class="table deal-list"><thead><tr><th>Сделка</th><th>Клиент</th><th>Этап</th><th>Сегмент</th><th>Цена</th><th>Прогноз</th></tr></thead><tbody>${rows.map(deal => `<tr class="clickable-row" data-action="deal-detail" data-deal-id="${esc(deal.id)}"><td><b>${esc(deal.title)}</b></td><td>${esc(deal.contact_name || deal.phone_normalized || '—')}</td><td><span class="badge">${esc(deal.stage)}</span></td><td>${esc(deal.qualification_segment || 'unknown')}</td><td>${money(deal.final_contract_price || deal.quoted_price || deal.amount)}</td><td>${money(deal.projected_owner_income)}</td></tr>`).join('')}</tbody></table>`
     : '<section class="panel"><p class="muted">Сделок пока нет.</p></section>';
+  bindDealOpeners($('#content'));
 }
 
 async function dealDetail(id) {
@@ -675,6 +689,7 @@ async function pipeline() {
         return `<section class="stage"><h3>${esc(stage)} · ${aggregate.count}</h3><small>Прогноз ${money(aggregate.projected)}</small>${stageCards.map(deal => `<button type="button" class="deal-card" data-action="deal-detail" data-deal-id="${esc(deal.id)}"><b>${esc(deal.title)}</b><small>${esc(deal.contact_name || deal.phone_normalized || '—')} · ${money(deal.commercial_value)}</small></button>`).join('')}</section>`;
       }).join('')}</div>`
       : '<section class="panel"><p class="muted">В выбранном сегменте сделок нет.</p></section>';
+    bindDealOpeners($('#pipeline-body'));
   };
   $('#content').innerHTML = `<div class="toolbar"><button class="secondary" data-segment="all">ALL</button><button class="secondary" data-segment="under_80k">&lt;80k</button><button class="secondary" data-segment="over_80k">80k+</button></div><div id="pipeline-body"></div>`; $$('#content [data-segment]').forEach(b=>b.onclick=()=>render(b.dataset.segment)); render('all');
 }
