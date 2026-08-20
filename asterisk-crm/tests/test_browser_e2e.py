@@ -549,6 +549,35 @@ class DealWorkspaceBrowserAcceptanceTests(unittest.TestCase):
             browser.wait_for("!document.querySelector('#login').classList.contains('hidden')")
             self.assertTrue(browser.evaluate("document.querySelector('#mobile-more-sheet').classList.contains('hidden')"))
 
+    def test_mobile_pipeline_cards_are_readable_without_horizontal_lane_scroll(self) -> None:
+        with browser_session() as (fixture, browser):
+            browser.viewport(390, 844, mobile=True)
+            browser.goto(fixture.url + "/")
+            browser.wait_for("document.querySelector('#workspace') && !document.querySelector('#workspace').classList.contains('hidden')")
+            browser.click('button[data-view="pipeline"]')
+            card_selector = f'.pipeline a.deal-card[data-deal-id="{DEAL_ID}"]'
+            browser.wait_for(f"Boolean(document.querySelector({json.dumps(card_selector)}))")
+            layout = browser.evaluate(
+                "(() => {"
+                f"const card = document.querySelector({json.dumps(card_selector)});"
+                "const pipeline = document.querySelector('.pipeline');"
+                "const stage = card.closest('.stage');"
+                "return {"
+                "cardWidth: Math.round(card.getBoundingClientRect().width),"
+                "stageWidth: Math.round(stage.getBoundingClientRect().width),"
+                "scrollWidth: Math.round(pipeline.scrollWidth),"
+                "clientWidth: Math.round(pipeline.clientWidth),"
+                "color: getComputedStyle(card).color,"
+                "decoration: getComputedStyle(card).textDecorationLine"
+                "};"
+                "})()"
+            )
+            self.assertGreaterEqual(layout["cardWidth"], 280)
+            self.assertGreaterEqual(layout["stageWidth"], layout["cardWidth"])
+            self.assertLessEqual(layout["scrollWidth"], layout["clientWidth"] + 1)
+            self.assertNotEqual("rgb(0, 0, 238)", layout["color"])
+            self.assertEqual("none", layout["decoration"])
+
     def test_deals_tab_never_falls_back_to_dashboard(self) -> None:
         with browser_session() as (fixture, browser):
             browser.goto(fixture.url + "/")

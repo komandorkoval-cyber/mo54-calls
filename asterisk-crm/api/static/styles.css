@@ -45,3 +45,16 @@ button:disabled{cursor:not-allowed;opacity:.62}.password-card{padding-bottom:42p
 }
 
 @media(min-width:601px){.mobile-more{display:none!important}.nav-mobile-label{display:none!important}}
+
+/* On a phone, funnel stages are a vertical workflow, not a six-column strip. */
+@media(max-width:600px){
+  .toolbar{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:16px}
+  .toolbar .secondary{width:100%;min-height:44px;padding:10px 4px;font-size:14px}
+  .pipeline{grid-template-columns:minmax(0,1fr);gap:12px;width:100%;overflow:visible}
+  .stage{min-height:0;padding:16px}
+  .stage h3{margin:0;line-height:1.35;overflow-wrap:anywhere}
+  .stage>small{display:block;margin-top:6px}
+  .pipeline .deal-card,.pipeline .deal-card:visited{display:block;width:100%;min-width:0;margin-top:12px;padding:14px;color:var(--ink)!important;text-decoration:none!important;overflow-wrap:anywhere}
+  .pipeline .deal-card b{display:block;color:var(--ink);font-size:15px;line-height:1.35;text-decoration:none}
+  .pipeline .deal-card small{font-size:12px;line-height:1.4;text-decoration:none;overflow-wrap:anywhere}
+}
