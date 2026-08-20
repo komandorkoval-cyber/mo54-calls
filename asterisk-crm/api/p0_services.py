@@ -152,6 +152,18 @@ def calculate_economics(inputs: EconomicsInputs, settings: EconomicsSettings) ->
         return None if denominator <= 0 else direct_cost / denominator
 
     floor_8, floor_10, floor_12 = floor(Decimal("8")), floor(Decimal("10")), floor(Decimal("12"))
+    # ``ae_percent`` is persisted as NUMERIC(12,8).  Keep a deliberately
+    # extreme below-floor quote reproducible and reportable instead of letting
+    # PostgreSQL turn an otherwise reviewable P0 revision into a 500 error.
+    if abs(ae_percent) >= Decimal("10000"):
+        return EconomicsResult(
+            _money(director_profit), _money(ae_amount), None,
+            _money(floor_8) if floor_8 is not None else None,
+            _money(floor_10) if floor_10 is not None else None,
+            _money(floor_12) if floor_12 is not None else None,
+            None, None, None, "rebuild_or_reject",
+            "AE percentage is outside the supported persistence range",
+        )
     if floor_8 is None:
         return EconomicsResult(_money(director_profit), _money(ae_amount), ae_percent.quantize(PERCENT),
                                None, None, None, None, None, None, "rebuild_or_reject",
@@ -237,8 +249,16 @@ def write_economics_revision(cursor: Any, deal_id: UUID, inputs: EconomicsInputs
     cursor.execute("SELECT id FROM deals WHERE id=%s FOR UPDATE", (deal_id,))
     if not cursor.fetchone():
         raise ValueError("Deal not found")
-    cursor.execute("SELECT coalesce(max(revision), 0) + 1 FROM deal_economics_revisions WHERE deal_id=%s", (deal_id,))
-    revision = cursor.fetchone()[0]
+    cursor.execute(
+        "SELECT coalesce(max(revision), 0) + 1 AS next_revision "
+        "FROM deal_economics_revisions WHERE deal_id=%s",
+        (deal_id,),
+    )
+    revision_row = cursor.fetchone()
+    # The service is also used by API cursors configured with ``dict_row``.
+    # Keep the pure service compatible with both those rows and tuple cursors
+    # used by the focused unit tests.
+    revision = revision_row["next_revision"] if isinstance(revision_row, Mapping) else revision_row[0]
     result = calculate_economics(inputs, settings)
     cursor.execute(
         """INSERT INTO deal_economics_revisions(
@@ -259,7 +279,8 @@ def write_economics_revision(cursor: Any, deal_id: UUID, inputs: EconomicsInputs
          result.price_floor_ae_12, result.owner_income_solo, result.owner_income_with_partner,
          result.projected_owner_income, result.economics_status, result.calculation_error, actor_id),
     )
-    revision_id = cursor.fetchone()[0]
+    revision_row = cursor.fetchone()
+    revision_id = revision_row["id"] if isinstance(revision_row, Mapping) else revision_row[0]
     cursor.execute("UPDATE deals SET current_economics_revision_id=%s,updated_at=now() WHERE id=%s", (revision_id, deal_id))
     return revision_id, result
 
@@ -321,7 +342,8 @@ def settle_cost_obligation(cursor: Any, obligation_id: UUID, *, occurred_at: Any
            VALUES(%s,%s,'realized_cost_outflow',%s,%s,%s,%s,%s) RETURNING id""",
         (deal_id, obligation_id, amount, occurred_at, confirmed_at, note, actor_id),
     )
-    movement_id = cursor.fetchone()[0]
+    movement_row = cursor.fetchone()
+    movement_id = movement_row["id"] if isinstance(movement_row, Mapping) else movement_row[0]
     cursor.execute(
         """UPDATE deal_cost_obligations
            SET status='settled',settled_at=%s,settled_movement_id=%s,updated_at=now() WHERE id=%s""",

@@ -62,6 +62,15 @@ class FunnelAndEconomicsTests(unittest.TestCase):
         self.assertIsNotNone(result.calculation_error)
         self.assertIsNone(result.price_floor_ae_8)
 
+    def test_extreme_below_floor_quote_is_reportable_not_a_database_overflow(self):
+        result = calculate_economics(EconomicsInputs(
+            quoted_price=Decimal("1"), materials_cost=Decimal("70000"), installation_mode="solo",
+        ), SETTINGS)
+        self.assertEqual(result.economics_status, "rebuild_or_reject")
+        self.assertIsNone(result.ae_percent)
+        self.assertIsNotNone(result.price_floor_ae_8)
+        self.assertIn("persistence range", result.calculation_error)
+
     def test_safe_cash_keeps_settled_cost_as_realized_outflow(self):
         totals = calculate_safe_cash(
             [

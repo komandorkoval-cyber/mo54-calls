@@ -53,10 +53,17 @@ class PostgresHarness:
         subprocess.run(["docker", "rm", "-f", self.container], check=False, capture_output=True)
 
     def sql(self, database: str, source: str) -> str:
-        result = subprocess.run(
-            ["docker", "exec", "-i", self.container, "psql", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database],
-            input=source, text=True, encoding="utf-8", capture_output=True,
-        )
+        # Docker can report pg_isready a fraction before a fresh psql exec sees
+        # the socket.  Retry only that transient bootstrap symptom; migration
+        # errors themselves still fail on the first result.
+        for attempt in range(4):
+            result = subprocess.run(
+                ["docker", "exec", "-i", self.container, "psql", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database],
+                input=source, text=True, encoding="utf-8", capture_output=True,
+            )
+            if result.returncode == 0 or "connection to server on socket" not in result.stderr or attempt == 3:
+                break
+            time.sleep(0.25)
         if result.returncode:
             raise AssertionError(f"psql failed:\n{result.stdout}\n{result.stderr}")
         return result.stdout

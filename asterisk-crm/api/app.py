@@ -41,6 +41,7 @@ from novofon import (
 from p0_services import (
     EconomicsInputs,
     EconomicsSettings,
+    calculate_economics,
     recognize_income_for_stage,
     semantic_funnel_stage,
     settle_cost_obligation,
@@ -404,6 +405,7 @@ class EconomicsRevisionCreate(BaseModel):
     fuel_cost: float = Field(0, ge=0)
     other_direct_cost: float = Field(0, ge=0)
     installation_mode: Literal["solo", "with_partner", "external_team", "unknown"] = "unknown"
+    price_floor_override_reason: str | None = Field(None, min_length=3, max_length=2000)
 
 
 class EconomicsSettingsCreate(BaseModel):
@@ -788,6 +790,34 @@ def ai_deal_update_conflicts(current: dict[str, Any], values: dict[str, Any], ba
     return conflicts
 
 
+def validate_ai_evidence_links(cursor: Any, call_id: int, proposed_fields: dict[str, Any]) -> None:
+    """Reject a reviewable-looking proposal whose evidence is not in its call.
+
+    The worker preserves model-provided offsets and quotes for review.  Approval
+    is the trust boundary: every non-unknown field must still be traceable to a
+    real transcript segment from the same call before it can change a deal.
+    """
+
+    for field in AI_DEAL_UPDATE_FIELDS:
+        proposal = proposed_fields.get(field) or {}
+        if proposal.get("inference_status") == "unknown":
+            continue
+        for evidence in proposal.get("evidence") or []:
+            started = evidence.get("segment_start_ms")
+            ended = evidence.get("segment_end_ms")
+            cursor.execute(
+                """SELECT s.text FROM transcript_segments s
+                   JOIN transcripts t ON t.id=s.transcript_id
+                   WHERE t.call_id=%s
+                     AND (%s IS NULL OR s.ended_ms IS NULL OR s.ended_ms >= %s)
+                     AND (%s IS NULL OR s.started_ms IS NULL OR s.started_ms <= %s)""",
+                (call_id, started, started, ended, ended),
+            )
+            quote = str(evidence["quote"]).casefold()
+            if not any(quote in str(row["text"]).casefold() for row in cursor.fetchall()):
+                raise HTTPException(422, f"Evidence для {field} не найдено в transcript звонка")
+
+
 def validate_transition_reason_catalog(cursor: Any, before: dict[str, Any], values: dict[str, Any]) -> None:
     """An archived reason remains visible historically but cannot be newly selected."""
 
@@ -808,10 +838,14 @@ def validate_transition_reason_catalog(cursor: Any, before: dict[str, Any], valu
             raise HTTPException(422, "Причина неактивна или отсутствует в справочнике")
 
 
-def enforce_price_floor_override(cursor: Any, deal_id: UUID, values: dict[str, Any], user: User) -> None:
+def enforce_price_floor_override(cursor: Any, deal_id: UUID, values: dict[str, Any], user: User) -> dict[str, Any] | None:
     if "quoted_price" not in values:
-        return
-    cursor.execute("SELECT price_floor_ae_8 FROM deal_economics_revisions WHERE id=(SELECT current_economics_revision_id FROM deals WHERE id=%s)", (deal_id,))
+        return None
+    cursor.execute(
+        """SELECT price_floor_ae_8,ae_amount,ae_percent FROM deal_economics_revisions
+           WHERE id=(SELECT current_economics_revision_id FROM deals WHERE id=%s)""",
+        (deal_id,),
+    )
     floor = cursor.fetchone()
     if floor and floor["price_floor_ae_8"] is not None and values["quoted_price"] < float(floor["price_floor_ae_8"]):
         reason = values.get("price_floor_override_reason")
@@ -819,6 +853,28 @@ def enforce_price_floor_override(cursor: Any, deal_id: UUID, values: dict[str, A
             raise HTTPException(422, "Цена ниже финансового пола AE 8%: укажите причину override")
         values["price_floor_overridden_at"] = datetime.now(timezone.utc)
         values["price_floor_overridden_by"] = user.id
+        return {
+            "price_floor_ae_8": floor["price_floor_ae_8"],
+            "ae_before": {"amount": floor["ae_amount"], "percent": floor["ae_percent"]},
+            "price_floor_override_reason": reason,
+        }
+    return None
+
+
+def economics_audit_context(before_revision: dict[str, Any] | None, result: Any,
+                            revision_id: UUID, override_reason: str | None = None) -> dict[str, Any]:
+    """Add reproducible economics facts to an otherwise ordinary deal audit."""
+
+    return {
+        "economics_revision_id": str(revision_id),
+        "price_floor_ae_8": result.price_floor_ae_8,
+        "ae_before": {
+            "amount": before_revision.get("ae_amount") if before_revision else None,
+            "percent": before_revision.get("ae_percent") if before_revision else None,
+        },
+        "ae_after": {"amount": result.ae_amount, "percent": result.ae_percent},
+        "price_floor_override_reason": override_reason,
+    }
 
 
 def current_economics_settings(cursor: Any) -> EconomicsSettings:
@@ -1316,7 +1372,8 @@ def decide_action_draft(draft_id: UUID, body: ActionDraftDecision, user: User = 
                 raise HTTPException(422, "Целевая сделка не связана с контактом звонка")
             require_deal_access(target, user)
             payload["base_values"] = draft.get("base_deal_snapshot") or payload.get("base_values")
-            values, _proposed_fields, baseline = ai_deal_update_values(payload)
+            values, proposed_fields, baseline = ai_deal_update_values(payload)
+            validate_ai_evidence_links(cur, draft["call_id"], proposed_fields)
             conflicts = ai_deal_update_conflicts(target, values, baseline)
             if conflicts:
                 raise HTTPException(409, {"detail": "AI draft устарел", "conflicts": conflicts})
@@ -1573,7 +1630,15 @@ def patch_deal(deal_id: UUID, body: DealPatch, user: User = Depends(current_user
         require_deal_access(locked_before, user)
         deal_stage_transition_allowed(locked_before, values)
         validate_transition_reason_catalog(cur, locked_before, values)
-        enforce_price_floor_override(cur, deal_id, values, user)
+        floor_override = enforce_price_floor_override(cur, deal_id, values, user)
+        source_revision = None
+        if "quoted_price" in values:
+            if not locked_before.get("current_economics_revision_id"):
+                raise HTTPException(409, "Для изменения цены сначала создайте economics revision")
+            cur.execute("SELECT * FROM deal_economics_revisions WHERE id=%s", (locked_before["current_economics_revision_id"],))
+            source_revision = cur.fetchone()
+            if not source_revision:
+                raise HTTPException(409, "Текущая economics revision не найдена")
         for json_key in ("decision_makers", "pain_secondary", "customer_quote_evidence"):
             if json_key in values:
                 values[json_key] = json.dumps(values[json_key], ensure_ascii=False)
@@ -1583,10 +1648,21 @@ def patch_deal(deal_id: UUID, body: DealPatch, user: User = Depends(current_user
             tuple(values.values()) + (deal_id,),
         )
         after = cur.fetchone()
+        economics_context: dict[str, Any] = {}
+        if source_revision:
+            settings = current_economics_settings(cur)
+            inputs = EconomicsInputs.from_row({**source_revision, "quoted_price": values["quoted_price"]})
+            revision_id, result = write_economics_revision(cur, deal_id, inputs, settings, user.id)
+            economics_context = economics_audit_context(
+                source_revision, result, revision_id,
+                floor_override["price_floor_override_reason"] if floor_override else None,
+            )
+            cur.execute("SELECT *,stage::text AS stage FROM deals WHERE id=%s", (deal_id,))
+            after = cur.fetchone()
         if "stage" in values:
             recognize_income_for_stage(cur, deal_id, after["stage"], user.id)
         conn.commit()
-    audit(user, "deal", str(deal_id), "update", locked_before, after)
+    audit(user, "deal", str(deal_id), "update", locked_before, {**after, **economics_context})
     return after
 
 
@@ -1628,18 +1704,43 @@ def economics_revisions(deal_id: UUID, user: User = Depends(current_user)):
 
 @app.post("/api/deals/{deal_id}/economics/revisions")
 def create_economics_revision(deal_id: UUID, body: EconomicsRevisionCreate, user: User = Depends(current_user)):
-    require_deal_access(fetch_one("SELECT id,owner_id FROM deals WHERE id=%s", (deal_id,)), user)
+    before = require_deal_access(fetch_one("SELECT * FROM deals WHERE id=%s", (deal_id,)), user)
     with pool.connection() as conn, conn.cursor() as cur:
         settings = current_economics_settings(cur)
-        revision_id, result = write_economics_revision(
-            cur, deal_id, EconomicsInputs.from_row(body.model_dump()), settings, user.id,
+        inputs = EconomicsInputs.from_row(body.model_dump())
+        preview = calculate_economics(inputs, settings)
+        below_floor = (
+            preview.price_floor_ae_8 is not None
+            and inputs.quoted_price < preview.price_floor_ae_8
         )
-        cur.execute("UPDATE deals SET quoted_price=%s,updated_at=now() WHERE id=%s", (body.quoted_price, deal_id))
+        if below_floor and not body.price_floor_override_reason:
+            raise HTTPException(422, "Цена ниже финансового пола AE 8%: укажите причину override")
+        before_revision = None
+        if before.get("current_economics_revision_id"):
+            cur.execute("SELECT ae_amount,ae_percent FROM deal_economics_revisions WHERE id=%s",
+                        (before["current_economics_revision_id"],))
+            before_revision = cur.fetchone()
+        revision_id, result = write_economics_revision(
+            cur, deal_id, inputs, settings, user.id,
+        )
+        cur.execute(
+            """UPDATE deals SET quoted_price=%s,price_floor_override_reason=%s,
+                   price_floor_overridden_at=%s,price_floor_overridden_by=%s,updated_at=now() WHERE id=%s""",
+            (
+                body.quoted_price,
+                body.price_floor_override_reason if below_floor else None,
+                datetime.now(timezone.utc) if below_floor else None,
+                user.id if below_floor else None,
+                deal_id,
+            ),
+        )
         cur.execute("SELECT * FROM deal_economics_revisions WHERE id=%s", (revision_id,))
         row = cur.fetchone()
         conn.commit()
-    audit(user, "deal_economics_revision", str(revision_id), "create", None,
-          {"deal_id": str(deal_id), "revision": row["revision"], "status": result.economics_status})
+    audit(user, "deal_economics_revision", str(revision_id), "create", before,
+          {"deal_id": str(deal_id), "revision": row["revision"], "settings_version": row["settings_version"],
+           "quoted_price": row["quoted_price"], "status": result.economics_status,
+           **economics_audit_context(before_revision, result, revision_id, body.price_floor_override_reason if below_floor else None)})
     return row
 
 

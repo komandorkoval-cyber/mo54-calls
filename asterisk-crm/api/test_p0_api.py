@@ -231,11 +231,16 @@ class DraftCursor:
             self.current = None
         elif "SELECT active FROM deal_reason_catalog" in sql:
             self.current = {"active": True}
+        elif "FROM transcript_segments" in sql:
+            self.current = None
         else:
             raise AssertionError(sql)
 
     def fetchone(self):
         return self.current
+
+    def fetchall(self):
+        return [{"text": "Нам нужна защита от дождя. Созвонимся позже."}]
 
     def __enter__(self):
         return self
