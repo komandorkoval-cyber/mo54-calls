@@ -599,7 +599,8 @@ class P0MobileAndClientContractTests(unittest.TestCase):
             "data-settle-obligation", "data-reverse-movement", "draft-diff",
             "data-segment=\"all\"", "data-segment=\"under_80k\"", "data-segment=\"over_80k\"",
             "/api/pipeline", "/api/pipeline/deals", "/cashflow", "/preview",
-            "navigate('deals')", "data-action=\"deal-detail\"", "bindDealOpeners", "id=\"delete-deal\"",
+            "navigate('deals')", "new URLSearchParams(window.location.search)",
+            "href=\"/?deal=${encodeURIComponent(deal.id)}\"", "id=\"delete-deal\"",
             "confirmation:'DELETE'", "delete v.price_floor_override_reason",
         ):
             self.assertIn(contract, script)

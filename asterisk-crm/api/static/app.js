@@ -244,6 +244,17 @@ async function start() {
     $('#user-role').textContent = user.role === 'admin' ? 'Администратор' : 'Менеджер';
     $('#avatar').textContent = (user.display_name || 'М')[0].toUpperCase();
     $('#admin-link').classList.toggle('hidden', user.role !== 'admin');
+    const requestedDealId = new URLSearchParams(window.location.search).get('deal');
+    if (requestedDealId) {
+      history.replaceState(null, '', window.location.pathname);
+      try {
+        await dealDetail(requestedDealId);
+      } catch (error) {
+        toast(`Не удалось открыть сделку: ${error.message}`);
+        navigate('dashboard');
+      }
+      return;
+    }
     navigate('dashboard');
   } catch {
     showLogin();
@@ -595,20 +606,18 @@ async function contactDetail(id) {
   const contact = await api(`/api/contacts/${encodeURIComponent(id)}`);
   setHead(contact.full_name || contact.phone_normalized, 'КАРТОЧКА КЛИЕНТА');
   const phone = contact.phone_normalized || contact.phone || '';
-  $('#content').innerHTML = `<div class="grid-2"><div class="panel"><h2>История звонков</h2>${callRows(asArray(contact.calls))}</div><div><div class="panel"><h2>Контакт</h2><p class="phone">${esc(phone)}</p></div><div class="panel"><h2>Сделки</h2>${asArray(contact.deals).map(deal => `<button class="task-row" data-action="deal-detail" data-deal-id="${esc(deal.id)}"><div><b>${esc(deal.title)}</b><small>${money(deal.amount)}</small></div><span class="badge">${esc(deal.stage)}</span></button>`).join('') || '<p class="muted">Сделок нет</p>'}</div></div></div>`;
+  $('#content').innerHTML = `<div class="grid-2"><div class="panel"><h2>История звонков</h2>${callRows(asArray(contact.calls))}</div><div><div class="panel"><h2>Контакт</h2><p class="phone">${esc(phone)}</p></div><div class="panel"><h2>Сделки</h2>${asArray(contact.deals).map(deal => `<a class="task-row deal-link" href="/?deal=${encodeURIComponent(deal.id)}"><div><b>${esc(deal.title)}</b><small>${money(deal.amount)}</small></div><span class="badge">${esc(deal.stage)}</span></a>`).join('') || '<p class="muted">Сделок нет</p>'}</div></div></div>`;
 
   const callbackButton = $('#callback-button');
   if (phone && callbackButton) callbackButton.onclick = () => initiateCall(contact);
-  bindDealOpeners($('#content'));
 }
 
 async function deals() {
   setHead('Сделки', 'РАБОЧИЙ СПИСОК');
   const rows = asArray(await api('/api/deals'));
   $('#content').innerHTML = rows.length
-    ? `<table class="table deal-list"><thead><tr><th>Сделка</th><th>Клиент</th><th>Этап</th><th>Сегмент</th><th>Цена</th><th>Прогноз</th></tr></thead><tbody>${rows.map(deal => `<tr class="clickable-row" data-action="deal-detail" data-deal-id="${esc(deal.id)}"><td><b>${esc(deal.title)}</b></td><td>${esc(deal.contact_name || deal.phone_normalized || '—')}</td><td><span class="badge">${esc(deal.stage)}</span></td><td>${esc(deal.qualification_segment || 'unknown')}</td><td>${money(deal.final_contract_price || deal.quoted_price || deal.amount)}</td><td>${money(deal.projected_owner_income)}</td></tr>`).join('')}</tbody></table>`
+    ? `<table class="table deal-list"><thead><tr><th>Сделка</th><th>Клиент</th><th>Этап</th><th>Сегмент</th><th>Цена</th><th>Прогноз</th></tr></thead><tbody>${rows.map(deal => `<tr><td><a class="deal-link" href="/?deal=${encodeURIComponent(deal.id)}"><b>${esc(deal.title)}</b></a></td><td>${esc(deal.contact_name || deal.phone_normalized || '—')}</td><td><span class="badge">${esc(deal.stage)}</span></td><td>${esc(deal.qualification_segment || 'unknown')}</td><td>${money(deal.final_contract_price || deal.quoted_price || deal.amount)}</td><td>${money(deal.projected_owner_income)}</td></tr>`).join('')}</tbody></table>`
     : '<section class="panel"><p class="muted">Сделок пока нет.</p></section>';
-  bindDealOpeners($('#content'));
 }
 
 async function dealDetail(id) {
@@ -686,10 +695,9 @@ async function pipeline() {
           projected: total.projected + Number(row.projected_owner_income || 0),
         }), {count: 0, projected: 0});
         const stageCards = dealCards.filter(deal => deal.stage === stage && (segment === 'all' || deal.qualification_segment === segment));
-        return `<section class="stage"><h3>${esc(stage)} · ${aggregate.count}</h3><small>Прогноз ${money(aggregate.projected)}</small>${stageCards.map(deal => `<button type="button" class="deal-card" data-action="deal-detail" data-deal-id="${esc(deal.id)}"><b>${esc(deal.title)}</b><small>${esc(deal.contact_name || deal.phone_normalized || '—')} · ${money(deal.commercial_value)}</small></button>`).join('')}</section>`;
+        return `<section class="stage"><h3>${esc(stage)} · ${aggregate.count}</h3><small>Прогноз ${money(aggregate.projected)}</small>${stageCards.map(deal => `<a class="deal-card deal-link" href="/?deal=${encodeURIComponent(deal.id)}"><b>${esc(deal.title)}</b><small>${esc(deal.contact_name || deal.phone_normalized || '—')} · ${money(deal.commercial_value)}</small></a>`).join('')}</section>`;
       }).join('')}</div>`
       : '<section class="panel"><p class="muted">В выбранном сегменте сделок нет.</p></section>';
-    bindDealOpeners($('#pipeline-body'));
   };
   $('#content').innerHTML = `<div class="toolbar"><button class="secondary" data-segment="all">ALL</button><button class="secondary" data-segment="under_80k">&lt;80k</button><button class="secondary" data-segment="over_80k">80k+</button></div><div id="pipeline-body"></div>`; $$('#content [data-segment]').forEach(b=>b.onclick=()=>render(b.dataset.segment)); render('all');
 }
