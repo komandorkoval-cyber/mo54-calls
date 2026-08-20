@@ -2,7 +2,7 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py novofon.py ./
+COPY app.py novofon.py p0_services.py ./
 COPY static ./static
 RUN addgroup --system crm && adduser --system --ingroup crm crm
 USER crm
