@@ -502,6 +502,11 @@ class P0EndToEndAcceptanceTests(unittest.TestCase):
             buckets = {(row["stage"], row["qualification_segment"]): row for row in pipeline.json()}
             self.assertIn(("proposal_sent", "over_80k"), buckets)
             self.assertIn(("measure_completed", "under_80k"), buckets)
+            cards = owner_client.get("/api/pipeline/deals", headers=owner_headers)
+            self.assertEqual(cards.status_code, 200, cards.text)
+            legacy_card = next(row for row in cards.json() if row["id"] == str(legacy["id"]))
+            self.assertEqual(legacy_card["stage"], "proposal_sent")
+            self.assertNotIn("source_stage", legacy_card)
             self.assertEqual(self.scalar("SELECT qualification_segment FROM deals WHERE id=%s", (legacy["id"],)), "over_80k")
             self.assertEqual(self.scalar("SELECT qualification_segment FROM deals WHERE id=%s", (new["id"],)), "under_80k")
 
@@ -543,6 +548,47 @@ class P0EndToEndAcceptanceTests(unittest.TestCase):
             other_client.close()
         self.assertGreaterEqual(self.scalar("SELECT count(*) FROM audit_log WHERE entity_type='deal_reason_catalog'"), 2)
 
+    def test_workspace_navigation_and_confirmed_duplicate_deletion(self):
+        _contact, duplicate = self.create_contact_and_deal(stage="proposal", qualification="over_80k", quoted_price=75000)
+        _protected_contact, protected = self.create_contact_and_deal()
+        owner_client, owner_headers = self.client_for(self.owner)
+        other_client, other_headers = self.client_for(self.other)
+        try:
+            listed = owner_client.get("/api/deals", headers=owner_headers)
+            self.assertEqual(listed.status_code, 200, listed.text)
+            self.assertIn(str(duplicate["id"]), {row["id"] for row in listed.json()})
+            card = next(row for row in owner_client.get("/api/pipeline/deals", headers=owner_headers).json()
+                        if row["id"] == str(duplicate["id"]))
+            self.assertEqual(card["stage"], "proposal_sent")
+
+            missing_confirmation = owner_client.request("DELETE", f"/api/deals/{duplicate['id']}", headers=owner_headers, json={})
+            self.assertEqual(missing_confirmation.status_code, 422)
+            forbidden = other_client.request("DELETE", f"/api/deals/{duplicate['id']}", headers=other_headers,
+                                             json={"confirmation": "DELETE"})
+            self.assertEqual(forbidden.status_code, 404)
+            deleted = owner_client.request("DELETE", f"/api/deals/{duplicate['id']}", headers=owner_headers,
+                                           json={"confirmation": "DELETE"})
+            self.assertEqual(deleted.status_code, 204, deleted.text)
+            self.assertEqual(owner_client.get(f"/api/deals/{duplicate['id']}", headers=owner_headers).status_code, 404)
+            deletion_audit = self.db(
+                """SELECT before_data,after_data FROM audit_log
+                   WHERE entity_type='deal' AND entity_id=%s AND action='delete'""",
+                (str(duplicate["id"]),),
+            )
+            self.assertEqual(deletion_audit["after_data"], {"deleted": True, "confirmation": "DELETE"})
+            self.assertEqual(deletion_audit["before_data"]["id"], str(duplicate["id"]))
+
+            movement = owner_client.post(f"/api/deals/{protected['id']}/cash-movements", headers=owner_headers,
+                                         json={"kind": "customer_incoming", "amount": 150000})
+            self.assertEqual(movement.status_code, 200, movement.text)
+            protected_delete = owner_client.request("DELETE", f"/api/deals/{protected['id']}", headers=owner_headers,
+                                                    json={"confirmation": "DELETE"})
+            self.assertEqual(protected_delete.status_code, 409)
+            self.assertEqual(owner_client.get(f"/api/deals/{protected['id']}", headers=owner_headers).status_code, 200)
+        finally:
+            owner_client.close()
+            other_client.close()
+
 
 class P0MobileAndClientContractTests(unittest.TestCase):
     def test_mobile_workspace_contract_keeps_primary_operations_reachable(self):
@@ -552,7 +598,9 @@ class P0MobileAndClientContractTests(unittest.TestCase):
             "#deal-workspace", "#cash-movement-form", "#obligation-create-form",
             "data-settle-obligation", "data-reverse-movement", "draft-diff",
             "data-segment=\"all\"", "data-segment=\"under_80k\"", "data-segment=\"over_80k\"",
-            "/api/pipeline", "/cashflow", "/preview", "delete v.price_floor_override_reason",
+            "/api/pipeline", "/api/pipeline/deals", "/cashflow", "/preview",
+            "navigate('deals')", "data-action=\"deal-detail\"", "id=\"delete-deal\"",
+            "confirmation:'DELETE'", "delete v.price_floor_override_reason",
         ):
             self.assertIn(contract, script)
         self.assertIn("@media(max-width:600px)", styles)

@@ -396,6 +396,12 @@ class DealPatch(BaseModel):
     installation_planned_date: datetime | None = None
 
 
+class DealDelete(BaseModel):
+    """An explicit browser confirmation prevents accidental deal removal."""
+
+    confirmation: Literal["DELETE"]
+
+
 class EconomicsRevisionCreate(BaseModel):
     quoted_price: float = Field(ge=0)
     materials_cost: float = Field(0, ge=0)
@@ -1694,6 +1700,51 @@ def deal_detail(deal_id: UUID, user: User = Depends(current_user)):
     return deal
 
 
+@app.delete("/api/deals/{deal_id}", status_code=204)
+def delete_deal(deal_id: UUID, body: DealDelete, user: User = Depends(current_user)):
+    """Remove an accidental, history-free duplicate after explicit confirmation.
+
+    Financial and economics records are intentionally immutable. Those links
+    use restrictive foreign keys, but checking them first gives the user a
+    clear conflict rather than a database error. Corrections to confirmed cash
+    movements remain compensating entries, never deal deletion.
+    """
+
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT *,stage::text AS stage FROM deals WHERE id=%s FOR UPDATE", (deal_id,))
+        before = require_deal_access(cur.fetchone(), user)
+        cur.execute(
+            """SELECT
+                   EXISTS(SELECT 1 FROM deal_economics_revisions WHERE deal_id=%s) AS economics,
+                   EXISTS(SELECT 1 FROM deal_income_recognitions WHERE deal_id=%s) AS recognition,
+                   EXISTS(SELECT 1 FROM deal_cash_movements WHERE deal_id=%s) AS cashflow,
+                   EXISTS(SELECT 1 FROM deal_cost_obligations WHERE deal_id=%s) AS obligations""",
+            (deal_id, deal_id, deal_id, deal_id),
+        )
+        history = cur.fetchone()
+        protected = [
+            label for key, label in (
+                ("economics", "историей экономики"),
+                ("recognition", "признанным доходом"),
+                ("cashflow", "подтверждёнными денежными движениями"),
+                ("obligations", "обязательствами"),
+            ) if history[key]
+        ]
+        if protected:
+            raise HTTPException(
+                409,
+                "Нельзя удалить сделку с " + ", ".join(protected)
+                + ". Финансовая и экономическая история остаётся неизменяемой.",
+            )
+        cur.execute("DELETE FROM deals WHERE id=%s", (deal_id,))
+        audit_in_transaction(
+            cur, user, "deal", str(deal_id), "delete", before,
+            {"deleted": True, "confirmation": body.confirmation},
+        )
+        conn.commit()
+    return Response(status_code=204)
+
+
 @app.get("/api/deals/{deal_id}/economics/revisions")
 def economics_revisions(deal_id: UUID, user: User = Depends(current_user)):
     require_deal_access(fetch_one("SELECT id,owner_id FROM deals WHERE id=%s", (deal_id,)), user)
@@ -2037,6 +2088,32 @@ def pipeline(user: User = Depends(current_user)):
         target["amount"] += row["amount"]
         target["projected_owner_income"] += row["projected_owner_income"]
     return list(grouped.values())
+
+
+@app.get("/api/pipeline/deals")
+def pipeline_deals(user: User = Depends(current_user)):
+    """Return funnel cards with their semantic stage resolved on the server.
+
+    The frontend deliberately receives no legacy-to-semantic mapping. This
+    keeps the dashboard, API consumers and the funnel aligned when legacy deal
+    stages are present.
+    """
+
+    rows = fetch_all(
+        """SELECT d.id,d.title,d.stage::text AS source_stage,d.qualification_segment,
+                  coalesce(d.final_contract_price,d.quoted_price,d.amount,0) AS commercial_value,
+                  coalesce(er.projected_owner_income,0) AS projected_owner_income,
+                  ct.full_name AS contact_name,ct.phone_normalized
+           FROM deals d
+           JOIN contacts ct ON ct.id=d.contact_id
+           LEFT JOIN deal_economics_revisions er ON er.id=d.current_economics_revision_id"""
+        + ("" if user.role == "admin" else " WHERE d.owner_id=%s")
+        + " ORDER BY d.updated_at DESC",
+        () if user.role == "admin" else (user.id,),
+    )
+    for row in rows:
+        row["stage"] = semantic_funnel_stage(row.pop("source_stage"))
+    return rows
 
 
 @app.get("/api/admin/jobs")

@@ -192,7 +192,9 @@ document.addEventListener('click', event => {
   if (action === 'navigate') navigate(control.dataset.view);
   if (action === 'call-detail' && Number.isSafeInteger(numericId) && numericId > 0) callDetail(numericId);
   if (action === 'contact-detail' && control.dataset.contactId) contactDetail(control.dataset.contactId);
-  if (action === 'deal-detail' && control.dataset.dealId) dealDetail(control.dataset.dealId);
+  if (action === 'deal-detail' && control.dataset.dealId) {
+    dealDetail(control.dataset.dealId).catch(error => toast(`Не удалось открыть сделку: ${error.message}`));
+  }
   if (action === 'complete-task' && control.dataset.taskId) completeTask(control.dataset.taskId);
   if (action === 'retry-call' && Number.isSafeInteger(numericId) && numericId > 0 && control.dataset.stage) {
     retryCall(numericId, control.dataset.stage);
@@ -210,7 +212,7 @@ function setHead(title, eyebrow = 'РАБОЧЕЕ ПРОСТРАНСТВО') {
 function navigate(view, argument) {
   state.view = view;
   $$('nav button').forEach(button => button.classList.toggle('active', button.dataset.view === view));
-  ({ dashboard, calls, contacts, tasks, pipeline, admin }[view] || dashboard)(argument);
+  ({ dashboard, calls, contacts, deals, tasks, pipeline, admin }[view] || dashboard)(argument);
 }
 
 async function start() {
@@ -583,7 +585,16 @@ async function contactDetail(id) {
   const phone = contact.phone_normalized || contact.phone || '';
   $('#content').innerHTML = `<div class="grid-2"><div class="panel"><h2>История звонков</h2>${callRows(asArray(contact.calls))}</div><div><div class="panel"><h2>Контакт</h2><p class="phone">${esc(phone)}</p></div><div class="panel"><h2>Сделки</h2>${asArray(contact.deals).map(deal => `<button class="task-row" data-action="deal-detail" data-deal-id="${esc(deal.id)}"><div><b>${esc(deal.title)}</b><small>${money(deal.amount)}</small></div><span class="badge">${esc(deal.stage)}</span></button>`).join('') || '<p class="muted">Сделок нет</p>'}</div></div></div>`;
 
-  if (phone) $('#callback-button').onclick = () => initiateCall(contact);
+  const callbackButton = $('#callback-button');
+  if (phone && callbackButton) callbackButton.onclick = () => initiateCall(contact);
+}
+
+async function deals() {
+  setHead('Сделки', 'РАБОЧИЙ СПИСОК');
+  const rows = asArray(await api('/api/deals'));
+  $('#content').innerHTML = rows.length
+    ? `<table class="table deal-list"><thead><tr><th>Сделка</th><th>Клиент</th><th>Этап</th><th>Сегмент</th><th>Цена</th><th>Прогноз</th></tr></thead><tbody>${rows.map(deal => `<tr class="clickable-row" data-action="deal-detail" data-deal-id="${esc(deal.id)}"><td><b>${esc(deal.title)}</b></td><td>${esc(deal.contact_name || deal.phone_normalized || '—')}</td><td><span class="badge">${esc(deal.stage)}</span></td><td>${esc(deal.qualification_segment || 'unknown')}</td><td>${money(deal.final_contract_price || deal.quoted_price || deal.amount)}</td><td>${money(deal.projected_owner_income)}</td></tr>`).join('')}</tbody></table>`
+    : '<section class="panel"><p class="muted">Сделок пока нет.</p></section>';
 }
 
 async function dealDetail(id) {
@@ -613,6 +624,7 @@ async function dealDetail(id) {
   setHead(deal.title, 'СДЕЛКА · МОБИЛЬНАЯ КАРТОЧКА');
   const below = deal.quoted_price != null && rev.price_floor_ae_8 != null && Number(deal.quoted_price) < Number(rev.price_floor_ae_8);
   $('#content').innerHTML = `<section class="panel deal-hero"><b>${esc(deal.qualification_segment)} | ${money(deal.quoted_price || deal.final_contract_price)} | AE ${rev.ae_percent == null ? '—' : `${(Number(rev.ae_percent)*100).toFixed(1)}%`} | ${esc(rev.economics_status || 'unknown')}</b><small>${esc(deal.stage)} · ${esc(deal.next_contact_at ? fmtDate(deal.next_contact_at) : 'следующий контакт не задан')}</small></section>${below ? '<div class="error">Цена ниже финансового пола AE 8%. Укажите причину override.</div>' : ''}<form class="panel form" id="deal-workspace"><h2>Квалификация</h2><label>Сегмент<select name="qualification_segment"><option>unknown</option><option value="under_80k">&lt;80k</option><option value="over_80k">80k+</option></select></label><label>Бюджет от<input name="estimated_budget_min" type="number" value="${esc(deal.estimated_budget_min || '')}"></label><label>Бюджет до<input name="estimated_budget_max" type="number" value="${esc(deal.estimated_budget_max || '')}"></label><label>Боль<textarea name="pain_primary">${esc(deal.pain_primary || '')}</textarea></label><label>ЛПР<textarea name="decision_makers">${esc(JSON.stringify(deal.decision_makers || []))}</textarea></label><label>Альтернатива<input name="alternative_considered" value="${esc(deal.alternative_considered || '')}"></label><label>Период монтажа<input name="desired_install_period" value="${esc(deal.desired_install_period || '')}"></label><label>Причина override<input name="price_floor_override_reason"></label><button class="primary">Сохранить</button></form><section class="panel"><h2>История экономики</h2>${asArray(deal.economics_revisions).map(r => `<p>R${r.revision} · AE ${money(r.ae_amount)} / ${(Number(r.ae_percent || 0)*100).toFixed(1)}% · floor 8/10/12: ${money(r.price_floor_ae_8)} / ${money(r.price_floor_ae_10)} / ${money(r.price_floor_ae_12)} · solo/partner ${money(r.owner_income_solo)} / ${money(r.owner_income_with_partner)} · ${esc(r.economics_status)} · settings ${r.settings_version}</p>`).join('') || 'Расчётов пока нет'}</section>`;
+  $('#content').insertAdjacentHTML('afterbegin', '<div class="actions deal-actions"><button class="secondary danger" type="button" id="delete-deal">Удалить сделку</button></div>');
   $('#deal-workspace').qualification_segment.value = deal.qualification_segment || 'unknown';
   $('#content').insertAdjacentHTML('beforeend', `<section class="panel"><h2>Cashflow · только подтверждённые факты</h2><div class="cashflow-summary"><p><small>Подтверждённые платежи клиентов</small><b>${money(cashflow.confirmed_customer_cash)}</b></p><p><small>Возвраты клиентам</small><b>${money(cashflow.refunds)}</b></p><p><small>Чистые деньги клиентов</small><b>${money(cashflow.net_confirmed_customer_cash)}</b></p><p><small>Фактическая себестоимость</small><b>${money(cashflow.realized_costs)}</b></p><p><small>Открытые обязательства</small><b>${money(cashflow.open_obligations)}</b></p><p><small>Прочие резервы</small><b>${money(cashflow.other_reserved_cash)}</b></p><p class="safe-cash"><small>Safe cash</small><b>${money(cashflow.safe_cash)}</b></p></div><form class="form compact-form" id="cash-movement-form"><h3>Подтвердить новое движение</h3><label>Тип<select name="kind"><option value="customer_incoming">Платёж клиента</option><option value="customer_refund">Возврат клиенту</option><option value="realized_cost_outflow">Фактическая себестоимость</option><option value="other_reserved_cash">Прочий резерв</option><option value="other_reserved_cash_release">Высвобождение прочего резерва</option></select></label><label>Сумма<input name="amount" type="number" min="0.01" step="0.01" required></label><label>Когда произошло<input name="occurred_at" type="datetime-local"></label><label>Комментарий<textarea name="note"></textarea></label><button class="primary">Подтвердить движение</button><small>Подтверждённые строки append-only: редактирование и удаление недоступны. Для исправления используйте «Компенсировать» в истории.</small></form><h3>История движений</h3>${movementRows}</section><section class="panel"><h2>Плановые обязательства</h2><form class="form compact-form" id="obligation-create-form"><label>Сумма<input name="amount" type="number" min="0.01" step="0.01" required></label><label>Описание<input name="description"></label><label>Срок<input name="due_date" type="date"></label><button class="primary">Добавить открытый резерв</button><small>Открытый резерв уменьшает safe cash. После settlement он исчезнет из резервов, а связанный фактический расход останется учтённым.</small></form><h3>История обязательств</h3>${obligationRows}</section>`);
   $('#deal-workspace').onsubmit = async e => { e.preventDefault(); const v=Object.fromEntries(new FormData(e.currentTarget)); ['estimated_budget_min','estimated_budget_max'].forEach(k=>v[k]=v[k]?Number(v[k]):null); if (!v.price_floor_override_reason) delete v.price_floor_override_reason; try { v.decision_makers=JSON.parse(v.decision_makers||'[]'); await api(`/api/deals/${id}`,{method:'PATCH',body:v}); toast('Сделка сохранена'); await dealDetail(id); } catch(err) { toast(err.message); } };
@@ -621,6 +633,16 @@ async function dealDetail(id) {
   $$('[data-obligation-form]').forEach(form => form.onsubmit = async e => { e.preventDefault(); const v=Object.fromEntries(new FormData(e.currentTarget)); v.amount=Number(v.amount); if (!v.description) v.description=null; if (!v.due_date) v.due_date=null; try { await api(`/api/deals/${id}/cost-obligations/${form.dataset.obligationForm}`, {method:'PATCH',body:v}); toast('Открытый резерв изменён'); await dealDetail(id); } catch(err) { toast(err.message); } });
   $$('[data-settle-obligation]').forEach(button => button.onclick = async () => { if (!window.confirm('Урегулировать обязательство и создать фактический расход?')) return; try { await api(`/api/deals/${id}/cost-obligations/${button.dataset.settleObligation}/settle`, {method:'POST'}); toast('Обязательство урегулировано; фактический расход добавлен'); await dealDetail(id); } catch(err) { toast(err.message); } });
   $$('[data-reverse-movement]').forEach(button => button.onclick = async () => { const reason=window.prompt('Причина компенсирующего движения'); if (!reason) return; try { await api(`/api/deals/${id}/cash-movements/${button.dataset.reverseMovement}/reverse`, {method:'POST',body:{reason}}); toast('Компенсирующее движение добавлено'); await dealDetail(id); } catch(err) { toast(err.message); } });
+  $('#delete-deal').onclick = async () => {
+    if (!window.confirm(`Удалить «${deal.title}»? Это действие нельзя отменить.`)) return;
+    try {
+      await api(`/api/deals/${id}`, {method:'DELETE', body:{confirmation:'DELETE'}});
+      toast('Сделка удалена');
+      navigate('deals');
+    } catch (error) {
+      toast(error.message);
+    }
+  };
 }
 
 async function tasks() {
@@ -637,7 +659,23 @@ async function completeTask(id) {
 
 async function pipeline() {
   setHead('Воронка', 'ПОДТВЕРЖДЁННЫЕ СДЕЛКИ');
-  const rows = asArray(await api('/api/pipeline')); const render = segment => { const data=rows.filter(r=>segment==='all'||r.qualification_segment===segment); $('#pipeline-body').innerHTML=`<div class="pipeline">${data.map(r=>`<section class="stage"><h3>${esc(r.stage)} · ${r.count}</h3><small>Прогноз ${money(r.projected_owner_income)}</small></section>`).join('')}</div>`; };
+  const [summary, cards] = await Promise.all([api('/api/pipeline'), api('/api/pipeline/deals')]);
+  const rows = asArray(summary);
+  const dealCards = asArray(cards);
+  const render = segment => {
+    const data = rows.filter(row => segment === 'all' || row.qualification_segment === segment);
+    const stages = [...new Set(data.map(row => row.stage))];
+    $('#pipeline-body').innerHTML = stages.length
+      ? `<div class="pipeline">${stages.map(stage => {
+        const aggregate = data.filter(row => row.stage === stage).reduce((total, row) => ({
+          count: total.count + Number(row.count || 0),
+          projected: total.projected + Number(row.projected_owner_income || 0),
+        }), {count: 0, projected: 0});
+        const stageCards = dealCards.filter(deal => deal.stage === stage && (segment === 'all' || deal.qualification_segment === segment));
+        return `<section class="stage"><h3>${esc(stage)} · ${aggregate.count}</h3><small>Прогноз ${money(aggregate.projected)}</small>${stageCards.map(deal => `<button type="button" class="deal-card" data-action="deal-detail" data-deal-id="${esc(deal.id)}"><b>${esc(deal.title)}</b><small>${esc(deal.contact_name || deal.phone_normalized || '—')} · ${money(deal.commercial_value)}</small></button>`).join('')}</section>`;
+      }).join('')}</div>`
+      : '<section class="panel"><p class="muted">В выбранном сегменте сделок нет.</p></section>';
+  };
   $('#content').innerHTML = `<div class="toolbar"><button class="secondary" data-segment="all">ALL</button><button class="secondary" data-segment="under_80k">&lt;80k</button><button class="secondary" data-segment="over_80k">80k+</button></div><div id="pipeline-body"></div>`; $$('#content [data-segment]').forEach(b=>b.onclick=()=>render(b.dataset.segment)); render('all');
 }
 

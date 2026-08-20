@@ -33,6 +33,33 @@ class DealTransitionPolicyTests(unittest.TestCase):
         app.deal_stage_transition_allowed(before, {"stage": "disqualified", "disqualification_reason": "small_object"})
         app.deal_stage_transition_allowed(before, {"stage": "decision_pending", "next_contact_at": "2026-08-21T10:00:00+07:00"})
 
+    def test_duplicate_removal_requires_an_explicit_confirmation(self):
+        self.assertEqual(app.DealDelete(confirmation="DELETE").confirmation, "DELETE")
+        with self.assertRaises(app.ValidationError):
+            app.DealDelete(confirmation="delete")
+
+
+class DealNavigationPolicyTests(unittest.TestCase):
+    def test_pipeline_cards_receive_semantic_stage_from_the_server(self):
+        user = app.User(id=uuid4(), email="owner@example.test", display_name="Owner", role="manager")
+        rows = [{
+            "id": uuid4(), "title": "Legacy proposal", "source_stage": "proposal",
+            "qualification_segment": "over_80k", "commercial_value": 75000,
+            "projected_owner_income": 12000, "contact_name": "Client", "phone_normalized": "+79990000000",
+        }]
+        with patch.object(app, "fetch_all", return_value=rows):
+            result = app.pipeline_deals(user)
+        self.assertEqual(result[0]["stage"], "proposal_sent")
+        self.assertNotIn("source_stage", result[0])
+
+    def test_confirmed_cash_movements_still_have_no_mutating_route(self):
+        cash_routes = {
+            (route.path, tuple(sorted(route.methods or [])))
+            for route in app.app.routes if "cash-movements" in route.path
+        }
+        self.assertNotIn(("/api/deals/{deal_id}/cash-movements/{movement_id}", ("DELETE",)), cash_routes)
+        self.assertNotIn(("/api/deals/{deal_id}/cash-movements/{movement_id}", ("PATCH",)), cash_routes)
+
 
 class DashboardPolicyTests(unittest.TestCase):
     def test_dashboard_derives_safe_cash_and_remaining_goal(self):
