@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>MO54 Calls</title>
   <link rel="stylesheet" href="/assets/styles.css">
+  <meta name="build-id" content="local">
 </head>
 <body>
   <section id="login" class="login">
@@ -35,14 +36,15 @@
   <div id="workspace" class="workspace hidden">
     <aside>
       <div class="logo"><span>M54</span><div>CALLS</div></div>
-      <nav>
-        <button data-view="dashboard" class="active"><i>◫</i>Обзор</button>
-        <button data-view="calls"><i>◉</i>Звонки</button>
-        <button data-view="contacts"><i>♙</i>Клиенты</button>
-        <button data-view="deals"><i>▣</i>Сделки</button>
-        <button data-view="tasks"><i>✓</i>Задачи</button>
-        <button data-view="pipeline"><i>⌁</i>Воронка</button>
-        <button data-view="admin" id="admin-link"><i>⚙</i>Обработка</button>
+      <nav aria-label="Основная навигация">
+        <button data-view="dashboard" class="active mobile-primary"><i>◫</i><span class="nav-desktop-label">Обзор</span><span class="nav-mobile-label">Главная</span></button>
+        <button data-view="calls" class="mobile-primary"><i>◉</i><span class="nav-desktop-label">Звонки</span><span class="nav-mobile-label">Звонки</span></button>
+        <button data-view="contacts" class="mobile-primary"><i>♙</i><span class="nav-desktop-label">Клиенты</span><span class="nav-mobile-label">Клиенты</span></button>
+        <button data-view="deals" class="mobile-secondary"><i>▣</i><span class="nav-desktop-label">Сделки</span></button>
+        <button data-view="tasks" class="mobile-secondary"><i>✓</i><span class="nav-desktop-label">Задачи</span></button>
+        <button data-view="pipeline" class="mobile-primary"><i>⌁</i><span class="nav-desktop-label">Воронка</span><span class="nav-mobile-label">Воронка</span></button>
+        <button data-view="admin" id="admin-link" class="mobile-secondary"><i>⚙</i><span class="nav-desktop-label">Обработка</span></button>
+        <button type="button" class="mobile-more" data-action="mobile-more" aria-controls="mobile-more-sheet" aria-expanded="false"><i>•••</i><span class="nav-mobile-label">Ещё</span></button>
       </nav>
       <div class="aside-foot">
         <div class="status-dot">Система работает</div>
@@ -57,6 +59,20 @@
       </header>
       <div id="content"></div>
     </main>
+  </div>
+  <div id="mobile-more-sheet" class="mobile-more-sheet hidden" role="dialog" aria-modal="true" aria-label="Дополнительные разделы">
+    <button type="button" class="mobile-more-backdrop" data-action="mobile-more-close" aria-label="Закрыть меню"></button>
+    <section class="mobile-more-panel">
+      <div class="mobile-more-handle" aria-hidden="true"></div>
+      <div class="mobile-more-head"><h2>Ещё</h2><button type="button" class="secondary" data-action="mobile-more-close">Закрыть</button></div>
+      <div class="mobile-more-actions">
+        <button type="button" data-action="navigate" data-view="deals"><i>▣</i>Сделки</button>
+        <button type="button" data-action="navigate" data-view="tasks"><i>✓</i>Задачи</button>
+        <button type="button" data-action="navigate" data-view="admin" id="mobile-admin-link"><i>⚙</i>Обработка</button>
+        <button type="button" data-action="mobile-logout"><i>↪</i>Выйти</button>
+      </div>
+      <p class="mobile-build">Версия интерфейса: <b id="mobile-build-id">—</b></p>
+    </section>
   </div>
   <div id="toast"></div>
   <script src="/assets/app.js"></script>

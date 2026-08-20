@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -16,7 +17,7 @@ from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from psycopg.rows import dict_row
@@ -49,6 +50,9 @@ from p0_services import (
 )
 
 DATABASE_URL = os.environ["DATABASE_URL"]
+FRONTEND_STATIC_DIR = Path(__file__).resolve().parent / "static"
+FRONTEND_ENTRY_ASSETS = frozenset({"app.js", "styles.css"})
+FRONTEND_IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
 # The browser credential is an opaque, server-side session. It is not a JWT
 # and JavaScript never receives it.
 SESSION_TTL_HOURS = int(os.environ.get("SESSION_TTL_HOURS", "12"))
@@ -304,7 +308,78 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="MO54 Calls CRM", version="1.1.0", lifespan=lifespan)
-app.mount("/assets", StaticFiles(directory="static"), name="assets")
+app.mount("/assets", StaticFiles(directory=FRONTEND_STATIC_DIR), name="assets")
+
+
+def frontend_asset_hash(asset_name: str) -> str:
+    """Return the content address for one browser entry asset.
+
+    The index page is deliberately rendered at request time so a freshly
+    deployed asset can never reuse a browser-cache key previously associated
+    with a different asset body.
+    """
+
+    if asset_name not in FRONTEND_ENTRY_ASSETS:
+        raise ValueError(f"Not a versioned frontend entry asset: {asset_name}")
+    return hashlib.sha256((FRONTEND_STATIC_DIR / asset_name).read_bytes()).hexdigest()
+
+
+def frontend_asset_url(asset_name: str) -> str:
+    return f"/assets/{asset_name}?v={frontend_asset_hash(asset_name)}"
+
+
+def frontend_build_id() -> str:
+    """A short, reproducible identifier for the delivered browser build."""
+
+    source = "\n".join(
+        f"{asset_name}:{frontend_asset_hash(asset_name)}"
+        for asset_name in sorted(FRONTEND_ENTRY_ASSETS)
+    )
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()[:12]
+
+
+def render_frontend_index() -> str:
+    """Inject content-addressed entry assets without mutating the source HTML."""
+
+    page = (FRONTEND_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    replacements = {
+        'href="/assets/styles.css"': f'href="{frontend_asset_url("styles.css")}"',
+        'src="/assets/app.js"': f'src="{frontend_asset_url("app.js")}"',
+    }
+    for source, target in replacements.items():
+        if source not in page:
+            raise RuntimeError(f"Frontend index is missing expected asset reference: {source}")
+        page = page.replace(source, target, 1)
+
+    build_meta = f'  <meta name="build-id" content="{frontend_build_id()}">'
+    if re.search(r'<meta\s+name="build-id"\s+content="[^"]*"\s*/?>', page):
+        return re.sub(
+            r'<meta\s+name="build-id"\s+content="[^"]*"\s*/?>',
+            build_meta,
+            page,
+            count=1,
+        )
+    if "</head>" not in page:
+        raise RuntimeError("Frontend index is missing its closing head tag")
+    return page.replace("</head>", f"{build_meta}\n</head>", 1)
+
+
+def request_has_current_frontend_asset_version(request: Request) -> bool:
+    """Only a single matching `v` parameter earns immutable cache semantics."""
+
+    prefix = "/assets/"
+    if not request.url.path.startswith(prefix):
+        return False
+    asset_name = request.url.path[len(prefix):]
+    if asset_name not in FRONTEND_ENTRY_ASSETS or len(request.query_params) != 1:
+        return False
+    versions = request.query_params.getlist("v")
+    if len(versions) != 1:
+        return False
+    try:
+        return hmac.compare_digest(versions[0], frontend_asset_hash(asset_name))
+    except OSError:
+        return False
 
 
 @app.middleware("http")
@@ -313,8 +388,14 @@ async def security_headers(request: Request, call_next):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "same-origin")
     response.headers.setdefault("X-Frame-Options", "DENY")
-    if request.url.path.startswith("/api/"):
+    if request.url.path == "/" or request.url.path.startswith("/api/"):
         response.headers.setdefault("Cache-Control", "no-store")
+    elif request.url.path.startswith("/assets/"):
+        response.headers["Cache-Control"] = (
+            FRONTEND_IMMUTABLE_CACHE_CONTROL
+            if request_has_current_frontend_asset_version(request)
+            else "no-store"
+        )
     return response
 
 
@@ -921,7 +1002,10 @@ def initial_password_change_message() -> str:
 
 @app.get("/")
 def index():
-    return FileResponse("static/index.html")
+    response = HTMLResponse(render_frontend_index())
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Frontend-Build"] = frontend_build_id()
+    return response
 
 
 @app.get("/health")

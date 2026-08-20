@@ -2,6 +2,11 @@ const state = {
   user: null,
   view: 'dashboard',
   callbackLocks: new Set(),
+  routeReady: false,
+  activeDealId: null,
+  dealContext: 'deals',
+  lastContext: 'dashboard',
+  dealRequestToken: 0,
 };
 
 const $ = selector => document.querySelector(selector);
@@ -101,7 +106,10 @@ function toast(message) {
 }
 
 function showLogin() {
+  closeMobileMore();
   state.user = null;
+  state.routeReady = false;
+  state.activeDealId = null;
   $('#workspace').classList.add('hidden');
   $('#password-change').classList.add('hidden');
   $('#login').classList.remove('hidden');
@@ -178,22 +186,35 @@ $('#password-change-form').onsubmit = async event => {
 };
 
 $$('nav button[data-view]').forEach(button => {
-  button.onclick = () => navigate(button.dataset.view);
+  button.onclick = () => { void navigate(button.dataset.view); };
 });
 
 // Dynamic workspace markup stays compatible with the strict production CSP:
 // actions use data attributes and one listener from this external script, not
 // inline `onclick` attributes (which CSP correctly blocks).
 document.addEventListener('click', event => {
+  const dealLink = event.target.closest('a.deal-link[data-deal-id]');
+  if (dealLink) {
+    event.preventDefault();
+    openDeal(dealLink.dataset.dealId, dealLink.dataset.dealContext);
+    return;
+  }
+
   const control = event.target.closest('[data-action]');
   if (!control) return;
   const action = control.dataset.action;
   const numericId = Number(control.dataset.callId);
-  if (action === 'navigate') navigate(control.dataset.view);
+  if (action === 'navigate') void navigate(control.dataset.view);
   if (action === 'call-detail' && Number.isSafeInteger(numericId) && numericId > 0) callDetail(numericId);
   if (action === 'contact-detail' && control.dataset.contactId) contactDetail(control.dataset.contactId);
-  if (action === 'deal-detail' && control.dataset.dealId) openDeal(control.dataset.dealId);
+  if (action === 'deal-detail' && control.dataset.dealId) openDeal(control.dataset.dealId, control.dataset.dealContext);
   if (action === 'complete-task' && control.dataset.taskId) completeTask(control.dataset.taskId);
+  if (action === 'deal-back') void returnFromDeal();
+  if (action === 'retry-deal-detail' && control.dataset.dealId) void retryDealDetail(control.dataset.dealId);
+  if (action === 'retry-cashflow' && control.dataset.dealId) void retryCashflow(control.dataset.dealId);
+  if (action === 'mobile-more') openMobileMore();
+  if (action === 'mobile-more-close') closeMobileMore();
+  if (action === 'mobile-logout') logout();
   if (action === 'retry-call' && Number.isSafeInteger(numericId) && numericId > 0 && control.dataset.stage) {
     retryCall(numericId, control.dataset.stage);
   }
@@ -202,18 +223,93 @@ document.addEventListener('click', event => {
   }
 });
 
-function openDeal(id) {
-  dealDetail(id).catch(error => toast(`Не удалось открыть сделку: ${error.message}`));
+const DEAL_HASH_PREFIX = '#/deals/';
+
+function normalizeDealContext(context) {
+  const value = String(context || '').trim();
+  if (value === 'pipeline' || value === 'deals' || value === 'contacts') return value;
+  if (/^contact:[^/?#]+$/.test(value)) return value;
+  return 'deals';
 }
 
-function bindDealOpeners(root = document) {
-  root.querySelectorAll('[data-action="deal-detail"][data-deal-id]').forEach(control => {
-    control.onclick = event => {
-      event.preventDefault();
-      event.stopPropagation();
-      openDeal(control.dataset.dealId);
-    };
-  });
+function dealContextLabel(context) {
+  if (String(context).startsWith('contact:')) return 'Назад к клиенту';
+  if (context === 'pipeline') return 'Назад к воронке';
+  if (context === 'contacts') return 'Назад к клиентам';
+  return 'Назад к сделкам';
+}
+
+function dealHash(id, context) {
+  const normalized = normalizeDealContext(context);
+  const from = normalized === 'deals' ? '' : `?from=${encodeURIComponent(normalized)}`;
+  return `${DEAL_HASH_PREFIX}${encodeURIComponent(id)}${from}`;
+}
+
+function parseDealRoute() {
+  const match = /^#\/deals\/([^/?#]+)(?:\?([^#]*))?$/.exec(window.location.hash || '');
+  if (!match) return null;
+  try {
+    const id = decodeURIComponent(match[1]);
+    const query = new URLSearchParams(match[2] || '');
+    return id ? { id, context: normalizeDealContext(query.get('from')) } : null;
+  } catch {
+    return null;
+  }
+}
+
+function contextForCurrentScreen() {
+  return normalizeDealContext(state.lastContext || state.view);
+}
+
+function openDeal(id, context = contextForCurrentScreen()) {
+  if (!id) return;
+  const normalizedContext = normalizeDealContext(context);
+  const destination = dealHash(id, normalizedContext);
+  state.dealContext = normalizedContext;
+  if (window.location.hash === destination) {
+    void routeFromLocation();
+    return;
+  }
+  window.location.hash = destination;
+}
+
+function normalizeLegacyDealRoute() {
+  const requestedDealId = new URLSearchParams(window.location.search).get('deal');
+  if (!requestedDealId) return false;
+  const from = new URLSearchParams(window.location.search).get('from');
+  const destination = `${window.location.pathname}${dealHash(requestedDealId, from)}`;
+  history.replaceState(history.state, '', destination);
+  return true;
+}
+
+function clearDealRoute() {
+  if (parseDealRoute()) history.pushState(history.state, '', window.location.pathname);
+}
+
+function setActiveNavigation(view) {
+  $$('nav button[data-view]').forEach(button => button.classList.toggle('active', button.dataset.view === view));
+}
+
+function openMobileMore() {
+  const sheet = $('#mobile-more-sheet');
+  if (!sheet) return;
+  sheet.classList.remove('hidden');
+  $('button[data-action="mobile-more"]')?.setAttribute('aria-expanded', 'true');
+}
+
+function closeMobileMore() {
+  const sheet = $('#mobile-more-sheet');
+  if (!sheet) return;
+  sheet.classList.add('hidden');
+  $('button[data-action="mobile-more"]')?.setAttribute('aria-expanded', 'false');
+}
+
+function renderViewError(view, error) {
+  $('#content').innerHTML = `<section class="panel inline-error"><h2>Не удалось загрузить раздел</h2><p>${esc(error.message || 'Проверьте соединение и повторите попытку.')}</p><div class="actions"><button class="primary" type="button" data-action="navigate" data-view="${esc(view)}">Повторить</button></div></section>`;
+}
+
+function isCurrentListContext(context) {
+  return !state.activeDealId && state.lastContext === context;
 }
 
 function setHead(title, eyebrow = 'РАБОЧЕЕ ПРОСТРАНСТВО') {
@@ -221,10 +317,54 @@ function setHead(title, eyebrow = 'РАБОЧЕЕ ПРОСТРАНСТВО') {
   $('#eyebrow').textContent = eyebrow;
 }
 
-function navigate(view, argument) {
+async function navigate(view, argument, { preserveDealRoute = false } = {}) {
+  closeMobileMore();
+  if (!preserveDealRoute) clearDealRoute();
+  state.activeDealId = null;
   state.view = view;
-  $$('nav button').forEach(button => button.classList.toggle('active', button.dataset.view === view));
-  ({ dashboard, calls, contacts, deals, tasks, pipeline, admin }[view] || dashboard)(argument);
+  state.lastContext = view;
+  setActiveNavigation(view);
+  const render = ({ dashboard, calls, contacts, deals, tasks, pipeline, admin }[view] || dashboard);
+  try {
+    await render(argument);
+  } catch (error) {
+    renderViewError(view, error);
+  }
+}
+
+async function renderReturnContext(context) {
+  const normalized = normalizeDealContext(context);
+  state.activeDealId = null;
+  if (normalized.startsWith('contact:')) {
+    const contactId = normalized.slice('contact:'.length);
+    state.view = 'contacts';
+    state.lastContext = normalized;
+    setActiveNavigation('contacts');
+    try {
+      await contactDetail(contactId);
+    } catch (error) {
+      renderViewError('contacts', error);
+    }
+    return;
+  }
+  await navigate(normalized);
+}
+
+async function returnFromDeal() {
+  const context = state.dealContext;
+  clearDealRoute();
+  await renderReturnContext(context);
+}
+
+async function routeFromLocation() {
+  const route = parseDealRoute();
+  if (route) {
+    state.dealContext = route.context;
+    await dealDetail(route.id, route.context);
+    return true;
+  }
+  if (state.activeDealId) await renderReturnContext(state.dealContext);
+  return false;
 }
 
 async function start() {
@@ -244,22 +384,19 @@ async function start() {
     $('#user-role').textContent = user.role === 'admin' ? 'Администратор' : 'Менеджер';
     $('#avatar').textContent = (user.display_name || 'М')[0].toUpperCase();
     $('#admin-link').classList.toggle('hidden', user.role !== 'admin');
-    const requestedDealId = new URLSearchParams(window.location.search).get('deal');
-    if (requestedDealId) {
-      history.replaceState(null, '', window.location.pathname);
-      try {
-        await dealDetail(requestedDealId);
-      } catch (error) {
-        toast(`Не удалось открыть сделку: ${error.message}`);
-        navigate('dashboard');
-      }
-      return;
-    }
-    navigate('dashboard');
+    $('#mobile-admin-link').classList.toggle('hidden', user.role !== 'admin');
+    $('#mobile-build-id').textContent = document.querySelector('meta[name="build-id"]')?.content || document.documentElement.dataset.buildId || '—';
+    normalizeLegacyDealRoute();
+    state.routeReady = true;
+    if (!await routeFromLocation()) await navigate('dashboard', undefined, { preserveDealRoute: true });
   } catch {
     showLogin();
   }
 }
+
+window.addEventListener('hashchange', () => {
+  if (state.routeReady) void routeFromLocation();
+});
 
 function callStatus(call) {
   return call.processing_status || call.status || call.call_status || 'received';
@@ -296,6 +433,7 @@ async function dashboard() {
     api('/api/calls?limit=5'),
     api('/api/tasks'),
   ]);
+  if (!isCurrentListContext('dashboard')) return;
 
   $('#content').innerHTML = `<section class="hero"><div><h2>Добрый день, ${esc(state.user.display_name)}.</h2><p>Главное на сегодня — не оставить клиента без следующего шага.</p></div><div class="date">${new Intl.DateTimeFormat('ru-RU', { dateStyle: 'full', timeZone: CRM_TIME_ZONE }).format(new Date())}</div></section>
     <section class="stats"><div class="stat"><small>Заработано владельцем</small><strong>${money(seasonData.earned_owner_income)}</strong><em>цель ${money(seasonData.goal_owner_income)}</em></div><div class="stat"><small>Прогноз дохода</small><strong>${money(seasonData.projected_owner_income)}</strong><em>по текущим сделкам</em></div><div class="stat"><small>Безопасные деньги</small><strong>${money(seasonData.safe_cash)}</strong><em>подтверждённый cashflow</em></div><div class="stat"><small>Осталось до цели</small><strong>${money(seasonData.remaining_to_goal)}</strong><em>по earned income</em></div></section>
@@ -323,6 +461,7 @@ async function calls() {
     const query = encodeURIComponent($('#call-q').value);
     const status = $('#call-status').value;
     const rows = await api(`/api/calls?q=${query}&status=${status}&limit=100`);
+    if (!isCurrentListContext('calls')) return;
     $('#calls-table').innerHTML = `<table class="table"><thead><tr><th>Клиент</th><th>Направление</th><th>Дата</th><th>Длительность</th><th>Источник</th><th>Статус</th><th>Следующий шаг</th></tr></thead><tbody>${asArray(rows).map(call => `<tr class="clickable-row" data-action="call-detail" data-call-id="${Number(call.id)}"><td><span class="phone">${esc(call.contact_name || call.phone_normalized || 'Неизвестный')}</span><br><small class="muted">${esc(call.phone_normalized || '')}</small></td><td>${call.direction === 'in' ? 'Входящий' : 'Исходящий'}</td><td>${fmtDate(call.started_at)}</td><td>${call.duration_sec || 0} сек.</td><td>${sourcePill(call) || '—'}</td><td>${statusPill(callStatus(call))}</td><td>${call.has_open_task ? 'Назначен' : '—'}</td></tr>`).join('')}</tbody></table>`;
   }
 
@@ -424,6 +563,7 @@ async function decideActionDraft(callId, draftId, decision) {
 }
 
 async function callDetail(id) {
+  state.lastContext = `call:${id}`;
   setHead('Карточка звонка', 'РАЗБОР РАЗГОВОРА');
   const call = await api(`/api/calls/${id}`);
   const insightData = call.insight?.data || {};
@@ -490,6 +630,7 @@ async function retryCall(id, stage) {
 async function contacts() {
   setHead('Клиенты', 'ЕДИНАЯ ИСТОРИЯ КОНТАКТОВ');
   const rows = await api('/api/contacts');
+  if (!isCurrentListContext('contacts')) return;
   $('#content').innerHTML = `<table class="table"><thead><tr><th>Клиент</th><th>Телефон</th><th>Email</th><th>Звонков</th><th>Последний контакт</th></tr></thead><tbody>${asArray(rows).map(contact => `<tr class="clickable-row" data-action="contact-detail" data-contact-id="${esc(contact.id)}"><td class="phone">${esc(contact.full_name || 'Без имени')}</td><td>${esc(contact.phone_normalized)}</td><td>${esc(contact.email || '—')}</td><td>${contact.calls_count || 0}</td><td>${fmtDate(contact.last_call_at)}</td></tr>`).join('')}</tbody></table>`;
 }
 
@@ -604,9 +745,10 @@ async function initiateCall(contact) {
 
 async function contactDetail(id) {
   const contact = await api(`/api/contacts/${encodeURIComponent(id)}`);
+  state.lastContext = `contact:${id}`;
   setHead(contact.full_name || contact.phone_normalized, 'КАРТОЧКА КЛИЕНТА');
   const phone = contact.phone_normalized || contact.phone || '';
-  $('#content').innerHTML = `<div class="grid-2"><div class="panel"><h2>История звонков</h2>${callRows(asArray(contact.calls))}</div><div><div class="panel"><h2>Контакт</h2><p class="phone">${esc(phone)}</p></div><div class="panel"><h2>Сделки</h2>${asArray(contact.deals).map(deal => `<a class="task-row deal-link" href="/?deal=${encodeURIComponent(deal.id)}"><div><b>${esc(deal.title)}</b><small>${money(deal.amount)}</small></div><span class="badge">${esc(deal.stage)}</span></a>`).join('') || '<p class="muted">Сделок нет</p>'}</div></div></div>`;
+  $('#content').innerHTML = `<div class="grid-2"><div class="panel"><h2>История звонков</h2>${callRows(asArray(contact.calls))}</div><div><div class="panel"><h2>Контакт</h2><p class="phone">${esc(phone)}</p></div><div class="panel"><h2>Сделки</h2>${asArray(contact.deals).map(deal => `<a class="task-row deal-link" href="${dealHash(deal.id, `contact:${id}`)}" data-deal-id="${esc(deal.id)}" data-deal-context="contact:${esc(id)}"><div><b>${esc(deal.title)}</b><small>${money(deal.amount)}</small><small class="deal-open-affordance">Открыть сделку →</small></div><span class="badge">${esc(deal.stage)}</span></a>`).join('') || '<p class="muted">Сделок нет</p>'}</div></div></div>`;
 
   const callbackButton = $('#callback-button');
   if (phone && callbackButton) callbackButton.onclick = () => initiateCall(contact);
@@ -615,17 +757,95 @@ async function contactDetail(id) {
 async function deals() {
   setHead('Сделки', 'РАБОЧИЙ СПИСОК');
   const rows = asArray(await api('/api/deals'));
+  if (!isCurrentListContext('deals')) return;
   $('#content').innerHTML = rows.length
-    ? `<table class="table deal-list"><thead><tr><th>Сделка</th><th>Клиент</th><th>Этап</th><th>Сегмент</th><th>Цена</th><th>Прогноз</th></tr></thead><tbody>${rows.map(deal => `<tr><td><a class="deal-link" href="/?deal=${encodeURIComponent(deal.id)}"><b>${esc(deal.title)}</b></a></td><td>${esc(deal.contact_name || deal.phone_normalized || '—')}</td><td><span class="badge">${esc(deal.stage)}</span></td><td>${esc(deal.qualification_segment || 'unknown')}</td><td>${money(deal.final_contract_price || deal.quoted_price || deal.amount)}</td><td>${money(deal.projected_owner_income)}</td></tr>`).join('')}</tbody></table>`
+    ? `<table class="table deal-list"><thead><tr><th>Сделка</th><th>Клиент</th><th>Этап</th><th>Сегмент</th><th>Цена</th><th>Прогноз</th></tr></thead><tbody>${rows.map(deal => `<tr><td><a class="deal-link" href="${dealHash(deal.id, 'deals')}" data-deal-id="${esc(deal.id)}" data-deal-context="deals"><b>${esc(deal.title)}</b><small class="deal-open-affordance">Открыть сделку →</small></a></td><td>${esc(deal.contact_name || deal.phone_normalized || '—')}</td><td><span class="badge">${esc(deal.stage)}</span></td><td>${esc(deal.qualification_segment || 'unknown')}</td><td>${money(deal.final_contract_price || deal.quoted_price || deal.amount)}</td><td>${money(deal.projected_owner_income)}</td></tr>`).join('')}</tbody></table>`
     : '<section class="panel"><p class="muted">Сделок пока нет.</p></section>';
 }
 
-async function dealDetail(id) {
-  const [deal, cashflow] = await Promise.all([
-    api(`/api/deals/${encodeURIComponent(id)}`),
-    api(`/api/deals/${encodeURIComponent(id)}/cashflow`),
+function dealWorkspaceShell(id, context) {
+  return `<section id="deal-workspace" class="deal-workspace" data-deal-id="${esc(id)}"><div class="deal-workspace-bar"><button class="secondary" type="button" data-action="deal-back">← ${esc(dealContextLabel(context))}</button><span class="muted">Рабочее пространство сделки</span></div><section id="deal-detail-region" class="deal-region"><div class="panel deal-loading" aria-live="polite">Загружаем квалификацию и экономику…</div></section><section id="cashflow-region" class="deal-region"><div class="panel deal-loading" aria-live="polite">Загружаем cashflow…</div></section></section>`;
+}
+
+function dealInlineError(id, kind, error) {
+  const detail = kind === 'detail';
+  const title = detail ? 'Не удалось загрузить сделку' : 'Не удалось загрузить cashflow';
+  const retryAction = detail ? 'retry-deal-detail' : 'retry-cashflow';
+  const errorId = detail ? 'deal-detail-error' : 'cashflow-error';
+  const note = detail
+    ? 'Квалификация и экономика пока недоступны. Сделка не была закрыта и не перенаправлена на обзор.'
+    : 'Квалификация и экономика сделки остаются доступными. Повторите загрузку денежных данных.';
+  return `<section id="${errorId}" class="panel inline-error" role="alert"><h2>${title}</h2><p>${esc(error.message || 'Проверьте соединение и повторите попытку.')}</p><small>${note}</small><div class="actions"><button class="primary" type="button" data-action="${retryAction}" data-deal-id="${esc(id)}">Повторить</button>${detail ? `<button class="secondary" type="button" data-action="deal-back">${esc(dealContextLabel(state.dealContext))}</button>` : ''}</div></section>`;
+}
+
+async function dealDetail(id, context = state.dealContext) {
+  const normalizedContext = normalizeDealContext(context);
+  const token = ++state.dealRequestToken;
+  state.activeDealId = id;
+  state.dealContext = normalizedContext;
+  setActiveNavigation('');
+  setHead('Сделка', 'РАБОЧЕЕ ПРОСТРАНСТВО СДЕЛКИ');
+  $('#content').innerHTML = dealWorkspaceShell(id, normalizedContext);
+  await Promise.allSettled([
+    loadDealDetail(id, token),
+    loadDealCashflow(id, token),
   ]);
+}
+
+async function retryDealDetail(id) {
+  const region = $('#deal-detail-region');
+  if (region) region.innerHTML = '<div class="panel deal-loading" aria-live="polite">Повторная загрузка квалификации и экономики…</div>';
+  await loadDealDetail(id, state.dealRequestToken);
+}
+
+async function retryCashflow(id) {
+  const region = $('#cashflow-region');
+  if (region) region.innerHTML = '<div class="panel deal-loading" aria-live="polite">Повторная загрузка cashflow…</div>';
+  await loadDealCashflow(id, state.dealRequestToken);
+}
+
+async function loadDealDetail(id, token) {
+  try {
+    const deal = await api(`/api/deals/${encodeURIComponent(id)}`);
+    if (token !== state.dealRequestToken || state.activeDealId !== id) return;
+    renderDealDetail(id, deal);
+  } catch (error) {
+    if (token !== state.dealRequestToken || state.activeDealId !== id) return;
+    $('#deal-detail-region').innerHTML = dealInlineError(id, 'detail', error);
+  }
+}
+
+async function loadDealCashflow(id, token) {
+  try {
+    const cashflow = await api(`/api/deals/${encodeURIComponent(id)}/cashflow`);
+    if (token !== state.dealRequestToken || state.activeDealId !== id) return;
+    renderDealCashflow(id, cashflow);
+  } catch (error) {
+    if (token !== state.dealRequestToken || state.activeDealId !== id) return;
+    $('#cashflow-region').innerHTML = dealInlineError(id, 'cashflow', error);
+  }
+}
+
+function renderDealDetail(id, deal) {
   const rev = asArray(deal.economics_revisions)[0] || {};
+  setHead(deal.title, 'СДЕЛКА · МОБИЛЬНАЯ КАРТОЧКА');
+  const below = deal.quoted_price != null && rev.price_floor_ae_8 != null && Number(deal.quoted_price) < Number(rev.price_floor_ae_8);
+  $('#deal-detail-region').innerHTML = `<div class="actions deal-actions"><button class="secondary danger" type="button" id="delete-deal">Удалить сделку</button></div><section class="panel deal-hero"><b>${esc(deal.qualification_segment)} | ${money(deal.quoted_price || deal.final_contract_price)} | AE ${rev.ae_percent == null ? '—' : `${(Number(rev.ae_percent)*100).toFixed(1)}%`} | ${esc(rev.economics_status || 'unknown')}</b><small>${esc(deal.stage)} · ${esc(deal.next_contact_at ? fmtDate(deal.next_contact_at) : 'следующий контакт не задан')}</small></section>${below ? '<div class="error">Цена ниже финансового пола AE 8%. Укажите причину override.</div>' : ''}<form class="panel form" id="deal-qualification-form"><h2>Квалификация</h2><label>Сегмент<select name="qualification_segment"><option>unknown</option><option value="under_80k">&lt;80k</option><option value="over_80k">80k+</option></select></label><label>Бюджет от<input name="estimated_budget_min" type="number" value="${esc(deal.estimated_budget_min || '')}"></label><label>Бюджет до<input name="estimated_budget_max" type="number" value="${esc(deal.estimated_budget_max || '')}"></label><label>Боль<textarea name="pain_primary">${esc(deal.pain_primary || '')}</textarea></label><label>ЛПР<textarea name="decision_makers">${esc(JSON.stringify(deal.decision_makers || []))}</textarea></label><label>Альтернатива<input name="alternative_considered" value="${esc(deal.alternative_considered || '')}"></label><label>Период монтажа<input name="desired_install_period" value="${esc(deal.desired_install_period || '')}"></label><label>Причина override<input name="price_floor_override_reason"></label><button class="primary">Сохранить</button></form><section class="panel"><h2>История экономики</h2>${asArray(deal.economics_revisions).map(r => `<p>R${r.revision} · AE ${money(r.ae_amount)} / ${(Number(r.ae_percent || 0)*100).toFixed(1)}% · floor 8/10/12: ${money(r.price_floor_ae_8)} / ${money(r.price_floor_ae_10)} / ${money(r.price_floor_ae_12)} · solo/partner ${money(r.owner_income_solo)} / ${money(r.owner_income_with_partner)} · ${esc(r.economics_status)} · settings ${r.settings_version}</p>`).join('') || 'Расчётов пока нет'}</section>`;
+  $('#deal-qualification-form').qualification_segment.value = deal.qualification_segment || 'unknown';
+  $('#deal-qualification-form').onsubmit = async e => { e.preventDefault(); const v=Object.fromEntries(new FormData(e.currentTarget)); ['estimated_budget_min','estimated_budget_max'].forEach(k=>v[k]=v[k]?Number(v[k]):null); if (!v.price_floor_override_reason) delete v.price_floor_override_reason; try { v.decision_makers=JSON.parse(v.decision_makers||'[]'); await api(`/api/deals/${id}`,{method:'PATCH',body:v}); toast('Сделка сохранена'); await dealDetail(id); } catch(err) { toast(err.message); } };
+  $('#delete-deal').onclick = async () => {
+    if (!window.confirm(`Удалить «${deal.title}»? Это действие нельзя отменить.`)) return;
+    try {
+      await api(`/api/deals/${id}`, {method:'DELETE', body:{confirmation:'DELETE'}});
+      toast('Сделка удалена');
+      await navigate('deals');
+    } catch (error) {
+      toast(error.message);
+    }
+  };
+}
+
+function renderDealCashflow(id, cashflow) {
   const movements = asArray(cashflow.movements);
   const obligations = asArray(cashflow.obligations);
   const movementLabels = {
@@ -644,33 +864,18 @@ async function dealDetail(id) {
     return `<article class="cash-history"><div><b>${esc(o.description || 'Плановая себестоимость')} · ${money(o.amount)}</b>${status}${settlement}</div>${editor}</article>`;
   }).join('') || '<p class="muted">Плановых обязательств пока нет.</p>';
   const movementRows = movements.map(m => `<article class="cash-history"><div><b>${esc(movementLabels[m.kind] || m.kind)} · ${money(m.amount)}</b><span class="badge completed">confirmed</span><small>${fmtDate(m.confirmed_at || m.occurred_at)}${m.note ? ` · ${esc(m.note)}` : ''}${m.reversal_of_movement_id ? ` · компенсация #${esc(m.reversal_of_movement_id)}` : ''}</small></div><button class="secondary" type="button" data-reverse-movement="${esc(m.id)}">Компенсировать</button></article>`).join('') || '<p class="muted">Подтверждённых движений пока нет.</p>';
-  setHead(deal.title, 'СДЕЛКА · МОБИЛЬНАЯ КАРТОЧКА');
-  const below = deal.quoted_price != null && rev.price_floor_ae_8 != null && Number(deal.quoted_price) < Number(rev.price_floor_ae_8);
-  $('#content').innerHTML = `<section class="panel deal-hero"><b>${esc(deal.qualification_segment)} | ${money(deal.quoted_price || deal.final_contract_price)} | AE ${rev.ae_percent == null ? '—' : `${(Number(rev.ae_percent)*100).toFixed(1)}%`} | ${esc(rev.economics_status || 'unknown')}</b><small>${esc(deal.stage)} · ${esc(deal.next_contact_at ? fmtDate(deal.next_contact_at) : 'следующий контакт не задан')}</small></section>${below ? '<div class="error">Цена ниже финансового пола AE 8%. Укажите причину override.</div>' : ''}<form class="panel form" id="deal-workspace"><h2>Квалификация</h2><label>Сегмент<select name="qualification_segment"><option>unknown</option><option value="under_80k">&lt;80k</option><option value="over_80k">80k+</option></select></label><label>Бюджет от<input name="estimated_budget_min" type="number" value="${esc(deal.estimated_budget_min || '')}"></label><label>Бюджет до<input name="estimated_budget_max" type="number" value="${esc(deal.estimated_budget_max || '')}"></label><label>Боль<textarea name="pain_primary">${esc(deal.pain_primary || '')}</textarea></label><label>ЛПР<textarea name="decision_makers">${esc(JSON.stringify(deal.decision_makers || []))}</textarea></label><label>Альтернатива<input name="alternative_considered" value="${esc(deal.alternative_considered || '')}"></label><label>Период монтажа<input name="desired_install_period" value="${esc(deal.desired_install_period || '')}"></label><label>Причина override<input name="price_floor_override_reason"></label><button class="primary">Сохранить</button></form><section class="panel"><h2>История экономики</h2>${asArray(deal.economics_revisions).map(r => `<p>R${r.revision} · AE ${money(r.ae_amount)} / ${(Number(r.ae_percent || 0)*100).toFixed(1)}% · floor 8/10/12: ${money(r.price_floor_ae_8)} / ${money(r.price_floor_ae_10)} / ${money(r.price_floor_ae_12)} · solo/partner ${money(r.owner_income_solo)} / ${money(r.owner_income_with_partner)} · ${esc(r.economics_status)} · settings ${r.settings_version}</p>`).join('') || 'Расчётов пока нет'}</section>`;
-  $('#content').insertAdjacentHTML('afterbegin', '<div class="actions deal-actions"><button class="secondary danger" type="button" id="delete-deal">Удалить сделку</button></div>');
-  $('#deal-workspace').qualification_segment.value = deal.qualification_segment || 'unknown';
-  $('#content').insertAdjacentHTML('beforeend', `<section class="panel"><h2>Cashflow · только подтверждённые факты</h2><div class="cashflow-summary"><p><small>Подтверждённые платежи клиентов</small><b>${money(cashflow.confirmed_customer_cash)}</b></p><p><small>Возвраты клиентам</small><b>${money(cashflow.refunds)}</b></p><p><small>Чистые деньги клиентов</small><b>${money(cashflow.net_confirmed_customer_cash)}</b></p><p><small>Фактическая себестоимость</small><b>${money(cashflow.realized_costs)}</b></p><p><small>Открытые обязательства</small><b>${money(cashflow.open_obligations)}</b></p><p><small>Прочие резервы</small><b>${money(cashflow.other_reserved_cash)}</b></p><p class="safe-cash"><small>Safe cash</small><b>${money(cashflow.safe_cash)}</b></p></div><form class="form compact-form" id="cash-movement-form"><h3>Подтвердить новое движение</h3><label>Тип<select name="kind"><option value="customer_incoming">Платёж клиента</option><option value="customer_refund">Возврат клиенту</option><option value="realized_cost_outflow">Фактическая себестоимость</option><option value="other_reserved_cash">Прочий резерв</option><option value="other_reserved_cash_release">Высвобождение прочего резерва</option></select></label><label>Сумма<input name="amount" type="number" min="0.01" step="0.01" required></label><label>Когда произошло<input name="occurred_at" type="datetime-local"></label><label>Комментарий<textarea name="note"></textarea></label><button class="primary">Подтвердить движение</button><small>Подтверждённые строки append-only: редактирование и удаление недоступны. Для исправления используйте «Компенсировать» в истории.</small></form><h3>История движений</h3>${movementRows}</section><section class="panel"><h2>Плановые обязательства</h2><form class="form compact-form" id="obligation-create-form"><label>Сумма<input name="amount" type="number" min="0.01" step="0.01" required></label><label>Описание<input name="description"></label><label>Срок<input name="due_date" type="date"></label><button class="primary">Добавить открытый резерв</button><small>Открытый резерв уменьшает safe cash. После settlement он исчезнет из резервов, а связанный фактический расход останется учтённым.</small></form><h3>История обязательств</h3>${obligationRows}</section>`);
-  $('#deal-workspace').onsubmit = async e => { e.preventDefault(); const v=Object.fromEntries(new FormData(e.currentTarget)); ['estimated_budget_min','estimated_budget_max'].forEach(k=>v[k]=v[k]?Number(v[k]):null); if (!v.price_floor_override_reason) delete v.price_floor_override_reason; try { v.decision_makers=JSON.parse(v.decision_makers||'[]'); await api(`/api/deals/${id}`,{method:'PATCH',body:v}); toast('Сделка сохранена'); await dealDetail(id); } catch(err) { toast(err.message); } };
+  $('#cashflow-region').innerHTML = `<section class="panel"><h2>Cashflow · только подтверждённые факты</h2><div class="cashflow-summary"><p><small>Подтверждённые платежи клиентов</small><b>${money(cashflow.confirmed_customer_cash)}</b></p><p><small>Возвраты клиентам</small><b>${money(cashflow.refunds)}</b></p><p><small>Чистые деньги клиентов</small><b>${money(cashflow.net_confirmed_customer_cash)}</b></p><p><small>Фактическая себестоимость</small><b>${money(cashflow.realized_costs)}</b></p><p><small>Открытые обязательства</small><b>${money(cashflow.open_obligations)}</b></p><p><small>Прочие резервы</small><b>${money(cashflow.other_reserved_cash)}</b></p><p class="safe-cash"><small>Safe cash</small><b>${money(cashflow.safe_cash)}</b></p></div><form class="form compact-form" id="cash-movement-form"><h3>Подтвердить новое движение</h3><label>Тип<select name="kind"><option value="customer_incoming">Платёж клиента</option><option value="customer_refund">Возврат клиенту</option><option value="realized_cost_outflow">Фактическая себестоимость</option><option value="other_reserved_cash">Прочий резерв</option><option value="other_reserved_cash_release">Высвобождение прочего резерва</option></select></label><label>Сумма<input name="amount" type="number" min="0.01" step="0.01" required></label><label>Когда произошло<input name="occurred_at" type="datetime-local"></label><label>Комментарий<textarea name="note"></textarea></label><button class="primary">Подтвердить движение</button><small>Подтверждённые строки append-only: редактирование и удаление недоступны. Для исправления используйте «Компенсировать» в истории.</small></form><h3>История движений</h3>${movementRows}</section><section class="panel"><h2>Плановые обязательства</h2><form class="form compact-form" id="obligation-create-form"><label>Сумма<input name="amount" type="number" min="0.01" step="0.01" required></label><label>Описание<input name="description"></label><label>Срок<input name="due_date" type="date"></label><button class="primary">Добавить открытый резерв</button><small>Открытый резерв уменьшает safe cash. После settlement он исчезнет из резервов, а связанный фактический расход останется учтённым.</small></form><h3>История обязательств</h3>${obligationRows}</section>`;
   $('#cash-movement-form').onsubmit = async e => { e.preventDefault(); const v=Object.fromEntries(new FormData(e.currentTarget)); v.amount=Number(v.amount); if (!v.occurred_at) v.occurred_at=null; if (!v.note) v.note=null; try { await api(`/api/deals/${id}/cash-movements`, {method:'POST',body:v}); toast('Подтверждённое движение добавлено'); await dealDetail(id); } catch(err) { toast(err.message); } };
   $('#obligation-create-form').onsubmit = async e => { e.preventDefault(); const v=Object.fromEntries(new FormData(e.currentTarget)); v.amount=Number(v.amount); if (!v.description) v.description=null; if (!v.due_date) v.due_date=null; try { await api(`/api/deals/${id}/cost-obligations`, {method:'POST',body:v}); toast('Открытый резерв добавлен'); await dealDetail(id); } catch(err) { toast(err.message); } };
-  $$('[data-obligation-form]').forEach(form => form.onsubmit = async e => { e.preventDefault(); const v=Object.fromEntries(new FormData(e.currentTarget)); v.amount=Number(v.amount); if (!v.description) v.description=null; if (!v.due_date) v.due_date=null; try { await api(`/api/deals/${id}/cost-obligations/${form.dataset.obligationForm}`, {method:'PATCH',body:v}); toast('Открытый резерв изменён'); await dealDetail(id); } catch(err) { toast(err.message); } });
-  $$('[data-settle-obligation]').forEach(button => button.onclick = async () => { if (!window.confirm('Урегулировать обязательство и создать фактический расход?')) return; try { await api(`/api/deals/${id}/cost-obligations/${button.dataset.settleObligation}/settle`, {method:'POST'}); toast('Обязательство урегулировано; фактический расход добавлен'); await dealDetail(id); } catch(err) { toast(err.message); } });
-  $$('[data-reverse-movement]').forEach(button => button.onclick = async () => { const reason=window.prompt('Причина компенсирующего движения'); if (!reason) return; try { await api(`/api/deals/${id}/cash-movements/${button.dataset.reverseMovement}/reverse`, {method:'POST',body:{reason}}); toast('Компенсирующее движение добавлено'); await dealDetail(id); } catch(err) { toast(err.message); } });
-  $('#delete-deal').onclick = async () => {
-    if (!window.confirm(`Удалить «${deal.title}»? Это действие нельзя отменить.`)) return;
-    try {
-      await api(`/api/deals/${id}`, {method:'DELETE', body:{confirmation:'DELETE'}});
-      toast('Сделка удалена');
-      navigate('deals');
-    } catch (error) {
-      toast(error.message);
-    }
-  };
+  $$('#cashflow-region [data-obligation-form]').forEach(form => form.onsubmit = async e => { e.preventDefault(); const v=Object.fromEntries(new FormData(e.currentTarget)); v.amount=Number(v.amount); if (!v.description) v.description=null; if (!v.due_date) v.due_date=null; try { await api(`/api/deals/${id}/cost-obligations/${form.dataset.obligationForm}`, {method:'PATCH',body:v}); toast('Открытый резерв изменён'); await dealDetail(id); } catch(err) { toast(err.message); } });
+  $$('#cashflow-region [data-settle-obligation]').forEach(button => button.onclick = async () => { if (!window.confirm('Урегулировать обязательство и создать фактический расход?')) return; try { await api(`/api/deals/${id}/cost-obligations/${button.dataset.settleObligation}/settle`, {method:'POST'}); toast('Обязательство урегулировано; фактический расход добавлен'); await dealDetail(id); } catch(err) { toast(err.message); } });
+  $$('#cashflow-region [data-reverse-movement]').forEach(button => button.onclick = async () => { const reason=window.prompt('Причина компенсирующего движения'); if (!reason) return; try { await api(`/api/deals/${id}/cash-movements/${button.dataset.reverseMovement}/reverse`, {method:'POST',body:{reason}}); toast('Компенсирующее движение добавлено'); await dealDetail(id); } catch(err) { toast(err.message); } });
 }
 
 async function tasks() {
   setHead('Задачи', 'ПЛАН СЛЕДУЮЩИХ ДЕЙСТВИЙ');
   const rows = await api('/api/tasks');
+  if (!isCurrentListContext('tasks')) return;
   $('#content').innerHTML = `<div class="panel">${taskRows(asArray(rows))}</div>`;
 }
 
@@ -683,6 +888,7 @@ async function completeTask(id) {
 async function pipeline() {
   setHead('Воронка', 'ПОДТВЕРЖДЁННЫЕ СДЕЛКИ');
   const [summary, cards] = await Promise.all([api('/api/pipeline'), api('/api/pipeline/deals')]);
+  if (!isCurrentListContext('pipeline')) return;
   const rows = asArray(summary);
   const dealCards = asArray(cards);
   const render = segment => {
@@ -695,7 +901,7 @@ async function pipeline() {
           projected: total.projected + Number(row.projected_owner_income || 0),
         }), {count: 0, projected: 0});
         const stageCards = dealCards.filter(deal => deal.stage === stage && (segment === 'all' || deal.qualification_segment === segment));
-        return `<section class="stage"><h3>${esc(stage)} · ${aggregate.count}</h3><small>Прогноз ${money(aggregate.projected)}</small>${stageCards.map(deal => `<a class="deal-card deal-link" href="/?deal=${encodeURIComponent(deal.id)}"><b>${esc(deal.title)}</b><small>${esc(deal.contact_name || deal.phone_normalized || '—')} · ${money(deal.commercial_value)}</small></a>`).join('')}</section>`;
+        return `<section class="stage"><h3>${esc(stage)} · ${aggregate.count}</h3><small>Прогноз ${money(aggregate.projected)}</small>${stageCards.map(deal => `<a class="deal-card deal-link" href="${dealHash(deal.id, 'pipeline')}" data-deal-id="${esc(deal.id)}" data-deal-context="pipeline"><b>${esc(deal.title)}</b><small>${esc(deal.contact_name || deal.phone_normalized || '—')} · ${money(deal.commercial_value)}</small><small class="deal-open-affordance">Открыть сделку →</small></a>`).join('')}</section>`;
       }).join('')}</div>`
       : '<section class="panel"><p class="muted">В выбранном сегменте сделок нет.</p></section>';
   };
@@ -709,6 +915,7 @@ async function admin() {
     api('/api/admin/novofon/employee-mappings').catch(() => []),
     api('/api/admin/deal-reasons').catch(() => []),
   ]);
+  if (!isCurrentListContext('admin')) return;
   const mappings = asArray(mappingsResponse?.items || mappingsResponse);
   const reasons = asArray(reasonsResponse);
   const ownMapping = mappings.find(mapping => String(mapping.crm_user_id || mapping.user_id) === String(state.user.id)) || {};

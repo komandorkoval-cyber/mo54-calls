@@ -595,12 +595,15 @@ class P0MobileAndClientContractTests(unittest.TestCase):
         script = (API / "static" / "app.js").read_text(encoding="utf-8")
         styles = (API / "static" / "styles.css").read_text(encoding="utf-8")
         for contract in (
-            "#deal-workspace", "#cash-movement-form", "#obligation-create-form",
+            "id=\"deal-workspace\"", "deal-detail-error", "cashflow-error",
+            "cashflow-region", "#cash-movement-form", "#obligation-create-form",
             "data-settle-obligation", "data-reverse-movement", "draft-diff",
             "data-segment=\"all\"", "data-segment=\"under_80k\"", "data-segment=\"over_80k\"",
             "/api/pipeline", "/api/pipeline/deals", "/cashflow", "/preview",
             "navigate('deals')", "new URLSearchParams(window.location.search)",
-            "href=\"/?deal=${encodeURIComponent(deal.id)}\"", "id=\"delete-deal\"",
+            "DEAL_HASH_PREFIX = '#/deals/'", "data-deal-id=\"${esc(deal.id)}\"",
+            "normalizeLegacyDealRoute", "data-action=\"deal-back\"",
+            "retry-deal-detail", "retry-cashflow", "id=\"delete-deal\"",
             "confirmation:'DELETE'", "delete v.price_floor_override_reason",
         ):
             self.assertIn(contract, script)
