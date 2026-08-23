@@ -2,8 +2,10 @@ const state = {
   user: null,
   view: 'dashboard',
   callbackLocks: new Set(),
+  callbackRequests: new Map(),
   routeReady: false,
   activeDealId: null,
+  activeContact: null,
   dealContext: 'deals',
   lastContext: 'dashboard',
   dealRequestToken: 0,
@@ -110,6 +112,7 @@ function showLogin() {
   state.user = null;
   state.routeReady = false;
   state.activeDealId = null;
+  state.activeContact = null;
   $('#workspace').classList.add('hidden');
   $('#password-change').classList.add('hidden');
   $('#login').classList.remove('hidden');
@@ -207,6 +210,20 @@ document.addEventListener('click', event => {
   if (action === 'navigate') void navigate(control.dataset.view);
   if (action === 'call-detail' && Number.isSafeInteger(numericId) && numericId > 0) callDetail(numericId);
   if (action === 'contact-detail' && control.dataset.contactId) contactDetail(control.dataset.contactId);
+  if (action === 'contact-create-open') openContactCreateForm();
+  if (action === 'contact-create-cancel') closeContactCreateForm();
+  if (action === 'contact-phone-call' && control.dataset.contactId && control.dataset.phoneNumberId) {
+    const phone = findContactPhone(control.dataset.contactId, control.dataset.phoneNumberId);
+    if (phone) void initiateCall(state.activeContact, phone);
+  }
+  if (action === 'callback-status-check' && control.dataset.contactId && control.dataset.phoneNumberId) {
+    const lockKey = String(control.dataset.contactId) + ':' + String(control.dataset.phoneNumberId);
+    const requestId = state.callbackRequests.get(lockKey);
+    if (requestId) void checkCallbackStatus(requestId, lockKey, control.dataset.phoneNumberId);
+  }
+  if (action === 'contact-phone-make-primary' && control.dataset.contactId && control.dataset.phoneNumberId) {
+    void makeContactPhonePrimary(control.dataset.contactId, control.dataset.phoneNumberId);
+  }
   if (action === 'deal-detail' && control.dataset.dealId) openDeal(control.dataset.dealId, control.dataset.dealContext);
   if (action === 'complete-task' && control.dataset.taskId) completeTask(control.dataset.taskId);
   if (action === 'deal-back') void returnFromDeal();
@@ -631,7 +648,149 @@ async function contacts() {
   setHead('Клиенты', 'ЕДИНАЯ ИСТОРИЯ КОНТАКТОВ');
   const rows = await api('/api/contacts');
   if (!isCurrentListContext('contacts')) return;
-  $('#content').innerHTML = `<table class="table"><thead><tr><th>Клиент</th><th>Телефон</th><th>Email</th><th>Звонков</th><th>Последний контакт</th></tr></thead><tbody>${asArray(rows).map(contact => `<tr class="clickable-row" data-action="contact-detail" data-contact-id="${esc(contact.id)}"><td class="phone">${esc(contact.full_name || 'Без имени')}</td><td>${esc(contact.phone_normalized)}</td><td>${esc(contact.email || '—')}</td><td>${contact.calls_count || 0}</td><td>${fmtDate(contact.last_call_at)}</td></tr>`).join('')}</tbody></table>`;
+  state.activeContact = null;
+  $('#content').innerHTML = `<section class="contacts-page"><div class="panel-head contacts-head"><h2>Клиенты</h2><button class="primary" type="button" data-action="contact-create-open">+ Добавить клиента</button></div><section id="contact-create-panel" class="panel compact-form contact-create-panel hidden"><div class="panel-head"><h2>Новый клиент</h2><button class="link" type="button" data-action="contact-create-cancel">Закрыть</button></div><form id="contact-create-form" class="form"><label>Имя клиента<input name="full_name" required maxlength="200" autocomplete="name" placeholder="Например, Анна Иванова"></label><label>Номер для связи<input name="phone" required maxlength="50" inputmode="tel" autocomplete="tel" placeholder="+7 999 123-45-67"></label><label>Email <input name="email" maxlength="254" inputmode="email" autocomplete="email"></label><label>Заметка<textarea name="notes" maxlength="5000" rows="2" placeholder="Откуда обращение, удобное время звонка"></textarea></label><p id="contact-create-error" class="form-error" role="alert"></p><div class="actions"><button class="primary" type="submit">Сохранить клиента</button><button class="secondary" type="button" data-action="contact-create-cancel">Отмена</button></div></form></section><div class="table-wrap"><table class="table"><thead><tr><th>Клиент</th><th>Телефон</th><th>Email</th><th>Звонков</th><th>Последний контакт</th></tr></thead><tbody>${asArray(rows).map(contact => `<tr class="clickable-row" data-action="contact-detail" data-contact-id="${esc(contact.id)}"><td class="phone">${esc(contact.full_name || 'Без имени')}</td><td>${esc(contact.phone_normalized)}</td><td>${esc(contact.email || '—')}</td><td>${contact.calls_count || 0}</td><td>${fmtDate(contact.last_call_at)}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">Клиентов пока нет. Добавьте первого вручную.</td></tr>'}</tbody></table></div></section>`;
+  bindContactCreateForm();
+}
+
+function openContactCreateForm() {
+  const panel = $('#contact-create-panel');
+  if (!panel) return;
+  panel.classList.remove('hidden');
+  setTimeout(() => $('#contact-create-form input[name="full_name"]')?.focus(), 0);
+}
+
+function closeContactCreateForm() {
+  $('#contact-create-panel')?.classList.add('hidden');
+}
+
+function showContactRefreshRecovery(error, contactId, savedText, failure) {
+  if (!error) return;
+  const form = error.closest('form');
+  form?.querySelector('[data-contact-refresh-retry]')?.remove();
+  error.className = 'form-error saved';
+  error.textContent = String(savedText) + ' Карточка пока не обновилась: '
+    + String(failure?.message || 'проверьте соединение') + '.';
+  const retry = document.createElement('button');
+  retry.type = 'button';
+  retry.className = 'secondary contact-refresh-retry';
+  retry.dataset.action = 'contact-detail';
+  retry.dataset.contactId = String(contactId);
+  retry.dataset.contactRefreshRetry = 'true';
+  retry.textContent = 'Повторить загрузку карточки';
+  error.insertAdjacentElement('afterend', retry);
+}
+
+function bindContactCreateForm() {
+  const form = $('#contact-create-form');
+  if (!form) return;
+  form.onsubmit = async event => {
+    event.preventDefault();
+    const values = Object.fromEntries(new FormData(form));
+    const error = $('#contact-create-error');
+    const submit = form.querySelector('button[type="submit"]');
+    error.className = 'form-error';
+    error.textContent = '';
+    form.querySelector('[data-contact-refresh-retry]')?.remove();
+    submit.disabled = true;
+    let contact;
+    try {
+      contact = await api('/api/contacts', {
+        method: 'POST',
+        body: {
+          full_name: values.full_name,
+          phone: values.phone,
+          email: values.email || null,
+          notes: values.notes || null,
+        },
+      });
+    } catch (failure) {
+      error.textContent = failure.message;
+      submit.disabled = false;
+      return;
+    }
+    // The POST has committed. Do not display a failed detail refresh as an
+    // unsaved client or leave the filled form ready to create a duplicate.
+    form.reset();
+    toast('Клиент добавлен. Теперь можно добавить другой номер или позвонить.');
+    try {
+      await contactDetail(contact.id);
+    } catch (failure) {
+      $('#contact-create-panel')?.classList.remove('hidden');
+      showContactRefreshRecovery(error, contact.id, 'Клиент сохранён.', failure);
+    } finally {
+      submit.disabled = false;
+    }
+  };
+}
+
+function contactRoleLabel(role) {
+  return ({ customer: 'Клиент', assistant: 'Помощник', other: 'Другой контакт' })[role] || 'Контакт';
+}
+
+function contactPhoneRow(contact, phone) {
+  const phoneId = String(phone.id || '');
+  const lockKey = `${String(contact.id || '')}:${phoneId}`;
+  const pending = state.callbackLocks.has(lockKey);
+  const active = phone.active !== false;
+  const primary = Boolean(phone.is_primary);
+  const canWrite = contact.can_write !== false;
+  const label = phone.label || (primary ? 'Основной' : 'Дополнительный');
+  const button = canWrite && active && phoneId
+    ? `<button class="primary phone-call-button" type="button" data-action="contact-phone-call" data-contact-id="${esc(contact.id)}" data-phone-number-id="${esc(phoneId)}"${pending ? ' disabled' : ''}>${pending ? 'Вызов отправлен' : 'Позвонить через Novofon'}</button>`
+    : (!active
+      ? '<span class="badge failed">Номер отключён</span>'
+      : '<span class="badge">Только просмотр</span>');
+  const primaryAction = canWrite && active && !primary && phoneId
+    ? `<button class="link" type="button" data-action="contact-phone-make-primary" data-contact-id="${esc(contact.id)}" data-phone-number-id="${esc(phoneId)}">Сделать основным</button>`
+    : '';
+  return `<article class="contact-phone-row ${active ? '' : 'inactive'}"><div class="contact-phone-copy"><div class="contact-phone-title"><b class="phone">${esc(phone.phone_normalized)}</b>${primary ? '<span class="badge ready">Основной</span>' : ''}</div><small>${esc(label)} · ${esc(contactRoleLabel(phone.role))}</small></div><div class="contact-phone-actions">${button}${primaryAction}</div><p class="callback-status ${pending ? 'pending' : ''}" data-callback-status="${esc(phoneId)}" aria-live="polite">${pending ? 'Novofon обрабатывает уже отправленный вызов. Повторно не нажимайте.' : ''}</p><div class="callback-result" data-callback-result="${esc(phoneId)}"></div></article>`;
+}
+
+function bindContactPhoneForm(contactId) {
+  const form = $('#contact-phone-form');
+  if (!form) return;
+  form.onsubmit = async event => {
+    event.preventDefault();
+    const values = Object.fromEntries(new FormData(form));
+    const error = $('#contact-phone-error');
+    const submit = form.querySelector('button[type="submit"]');
+    error.className = 'form-error';
+    error.textContent = '';
+    form.querySelector('[data-contact-refresh-retry]')?.remove();
+    submit.disabled = true;
+    try {
+      await api(`/api/contacts/${encodeURIComponent(contactId)}/phone-numbers`, {
+        method: 'POST',
+        body: {
+          phone: values.phone,
+          label: values.label,
+          role: values.role,
+          make_primary: values.make_primary === 'on',
+        },
+      });
+    } catch (failure) {
+      error.textContent = failure.message;
+      submit.disabled = false;
+      return;
+    }
+    // The number is already persisted at this point. A failed GET must offer
+    // a reload, never invite the manager to submit the same number again.
+    form.reset();
+    toast('Номер добавлен к клиенту.');
+    try {
+      await contactDetail(contactId);
+    } catch (failure) {
+      showContactRefreshRecovery(error, contactId, 'Номер сохранён.', failure);
+    } finally {
+      submit.disabled = false;
+    }
+  };
+}
+
+function findContactPhone(contactId, phoneId) {
+  if (String(state.activeContact?.id || '') !== String(contactId || '')) return null;
+  return asArray(state.activeContact?.phone_numbers).find(phone => String(phone.id) === String(phoneId)) || null;
 }
 
 function callbackText(status) {
@@ -648,14 +807,28 @@ function callbackCallId(result) {
   return result?.call_id || result?.call?.id || result?.crm_call_id || result?.data?.call_id || null;
 }
 
-function setCallbackStatus(message, kind = '') {
-  const element = $('#callback-status');
+function callbackStatusElement(phoneId) {
+  return Array.from($$('[data-callback-status]')).find(element => element.dataset.callbackStatus === String(phoneId)) || null;
+}
+
+function callbackResultElement(phoneId) {
+  return Array.from($$('[data-callback-result]')).find(element => element.dataset.callbackResult === String(phoneId)) || null;
+}
+
+function callbackButtonElement(phoneId) {
+  return Array.from($$('[data-phone-number-id]')).find(element => (
+    element.dataset.action === 'contact-phone-call' && element.dataset.phoneNumberId === String(phoneId)
+  )) || null;
+}
+
+function setCallbackStatus(phoneId, message, kind = '') {
+  const element = callbackStatusElement(phoneId);
   if (!element) return;
   element.className = `callback-status ${kind}`;
   element.textContent = message;
 }
 
-function showCallbackCardLink(callId) {
+function showCallbackCardLink(phoneId, callId) {
   const numericId = Number(callId);
   if (!Number.isSafeInteger(numericId) || numericId <= 0) return;
   const link = document.createElement('button');
@@ -664,12 +837,57 @@ function showCallbackCardLink(callId) {
   link.dataset.action = 'call-detail';
   link.dataset.callId = String(numericId);
   link.textContent = 'Открыть карточку звонка';
-  $('#callback-result')?.replaceChildren(link);
+  callbackResultElement(phoneId)?.replaceChildren(link);
+}
+
+function finishCallback(lockKey, phoneId, callId) {
+  state.callbackLocks.delete(lockKey);
+  state.callbackRequests.delete(lockKey);
+  setCallbackStatus(phoneId, 'Звонок завершён и добавлен в CRM.', 'accepted');
+  showCallbackCardLink(phoneId, callId);
+  const button = callbackButtonElement(phoneId);
+  if (button) {
+    button.disabled = false;
+    button.textContent = 'Позвонить ещё раз';
+  }
+}
+
+function showCallbackStatusCheck(phoneId, requestId, lockKey) {
+  const container = callbackResultElement(phoneId);
+  if (!container) return;
+  const check = document.createElement('button');
+  check.className = 'secondary callback-status-check';
+  check.type = 'button';
+  check.dataset.action = 'callback-status-check';
+  check.dataset.contactId = String(lockKey).split(':', 1)[0];
+  check.dataset.phoneNumberId = String(phoneId);
+  check.dataset.callbackRequestId = String(requestId);
+  check.textContent = 'Проверить статус';
+  container.replaceChildren(check);
+}
+
+async function checkCallbackStatus(requestId, lockKey, phoneId) {
+  const statusButton = callbackResultElement(phoneId)?.querySelector('[data-action="callback-status-check"]');
+  if (statusButton) statusButton.disabled = true;
+  try {
+    const current = await api('/api/calls/initiations/' + encodeURIComponent(requestId));
+    const callId = callbackCallId(current);
+    if (callId) {
+      finishCallback(lockKey, phoneId, callId);
+      return;
+    }
+    const status = String(current?.status || '').toLowerCase();
+    setCallbackStatus(phoneId, callbackText(status) + '. Повторный callback пока заблокирован.', 'pending');
+    showCallbackStatusCheck(phoneId, requestId, lockKey);
+  } catch (failure) {
+    setCallbackStatus(phoneId, 'Не удалось проверить статус: ' + String(failure.message || 'проверьте соединение') + '.', 'pending');
+    showCallbackStatusCheck(phoneId, requestId, lockKey);
+  }
 }
 
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
-async function observeCallback(requestId, contactId) {
+async function observeCallback(requestId, lockKey, phoneId) {
   // Call API acknowledges the request before Novofon has a completed call
   // session. Poll only the CRM's own protected endpoint; never expose or call
   // provider URLs from the mobile browser.
@@ -681,37 +899,38 @@ async function observeCallback(requestId, contactId) {
     } catch (failure) {
       // Keep the original callback locked. A temporary CRM network error must
       // not invite a second Call API request while Novofon may still be calling.
-      setCallbackStatus('Связь с CRM временно недоступна. Не нажимайте повторно: проверяем данные вызова.', 'pending');
+      setCallbackStatus(phoneId, 'Связь с CRM временно недоступна. Не нажимайте повторно: проверяем данные вызова.', 'pending');
       continue;
     }
     const callId = callbackCallId(current);
     if (callId) {
-      setCallbackStatus('Звонок завершён и добавлен в CRM.', 'accepted');
-      showCallbackCardLink(callId);
-      state.callbackLocks.delete(contactId);
+      finishCallback(lockKey, phoneId, callId);
       return;
     }
     const status = String(current?.status || '').toLowerCase();
     if (status === 'unknown') {
-      setCallbackStatus('Novofon ещё не подтвердил callback. Не нажимайте повторно: CRM продолжает ждать событие.', 'pending');
+      setCallbackStatus(phoneId, 'Novofon ещё не подтвердил callback. Не нажимайте повторно: CRM продолжает ждать событие.', 'pending');
     } else if (status === 'accepted' || status === 'requested') {
-      setCallbackStatus('Novofon принял запрос. Ожидайте обычный звонок на мобильный телефон.', 'accepted');
+      setCallbackStatus(phoneId, 'Novofon принял запрос. Ожидайте обычный звонок на мобильный телефон.', 'accepted');
     } else {
-      setCallbackStatus(callbackText(status), 'pending');
+      setCallbackStatus(phoneId, callbackText(status), 'pending');
     }
   }
-  setCallbackStatus('Карточка ещё не пришла от Novofon. Повторно не звоните: проверьте журнал позже или обратитесь к администратору.', 'pending');
+  setCallbackStatus(phoneId, 'Карточка ещё не пришла от Novofon. Повторный callback заблокирован до проверки статуса.', 'pending');
+  showCallbackStatusCheck(phoneId, requestId, lockKey);
 }
 
-async function initiateCall(contact) {
+async function initiateCall(contact, phoneNumber) {
   const contactId = String(contact.id || '');
-  const button = $('#callback-button');
-  if (!contactId || state.callbackLocks.has(contactId)) return;
+  const phoneId = String(phoneNumber?.id || '');
+  const lockKey = `${contactId}:${phoneId}`;
+  const button = callbackButtonElement(phoneId);
+  if (!contactId || !phoneId || !phoneNumber?.active || !button || state.callbackLocks.has(lockKey)) return;
 
   const key = idempotencyKey();
-  state.callbackLocks.add(contactId);
+  state.callbackLocks.add(lockKey);
   button.disabled = true;
-  setCallbackStatus('Соединяем с менеджером…', 'pending');
+  setCallbackStatus(phoneId, 'Соединяем с менеджером…', 'pending');
 
   try {
     const result = await api('/api/calls/initiate', {
@@ -719,39 +938,61 @@ async function initiateCall(contact) {
       headers: { 'Idempotency-Key': key },
       body: {
         contact_id: contact.id,
-        phone: contact.phone_normalized,
+        contact_phone_number_id: phoneNumber.id,
         idempotency_key: key,
       },
     });
     const callId = callbackCallId(result);
     const stateText = callbackText(result?.status || result?.call?.status || result?.request?.status);
-    setCallbackStatus(stateText, 'accepted');
+    setCallbackStatus(phoneId, stateText, 'accepted');
     button.textContent = 'Вызов отправлен';
     toast('Novofon звонит менеджеру. Ответьте на обычный звонок телефона.');
 
     if (callId) {
-      showCallbackCardLink(callId);
-      state.callbackLocks.delete(contactId);
+      finishCallback(lockKey, phoneId, callId);
     } else if (result?.id) {
-      observeCallback(result.id, contactId);
+      state.callbackRequests.set(lockKey, result.id);
+      observeCallback(result.id, lockKey, phoneId);
     }
   } catch (failure) {
-    state.callbackLocks.delete(contactId);
+    state.callbackLocks.delete(lockKey);
+    state.callbackRequests.delete(lockKey);
     button.disabled = false;
     button.textContent = 'Позвонить через Novofon';
-    setCallbackStatus(`Не удалось начать звонок: ${failure.message}`, 'failed');
+    setCallbackStatus(phoneId, `Не удалось начать звонок: ${failure.message}`, 'failed');
+  }
+}
+
+async function makeContactPhonePrimary(contactId, phoneId) {
+  try {
+    await api(`/api/contacts/${encodeURIComponent(contactId)}/phone-numbers/${encodeURIComponent(phoneId)}`, {
+      method: 'PATCH', body: { is_primary: true },
+    });
+    toast('Основной номер клиента изменён.');
+    await contactDetail(contactId);
+  } catch (failure) {
+    toast(`Не удалось изменить основной номер: ${failure.message}`);
   }
 }
 
 async function contactDetail(id) {
   const contact = await api(`/api/contacts/${encodeURIComponent(id)}`);
+  state.activeContact = contact;
   state.lastContext = `contact:${id}`;
   setHead(contact.full_name || contact.phone_normalized, 'КАРТОЧКА КЛИЕНТА');
-  const phone = contact.phone_normalized || contact.phone || '';
-  $('#content').innerHTML = `<div class="grid-2"><div class="panel"><h2>История звонков</h2>${callRows(asArray(contact.calls))}</div><div><div class="panel"><h2>Контакт</h2><p class="phone">${esc(phone)}</p></div><div class="panel"><h2>Сделки</h2>${asArray(contact.deals).map(deal => `<a class="task-row deal-link" href="${dealHash(deal.id, `contact:${id}`)}" data-deal-id="${esc(deal.id)}" data-deal-context="contact:${esc(id)}"><div><b>${esc(deal.title)}</b><small>${money(deal.amount)}</small><small class="deal-open-affordance">Открыть сделку →</small></div><span class="badge">${esc(deal.stage)}</span></a>`).join('') || '<p class="muted">Сделок нет</p>'}</div></div></div>`;
-
-  const callbackButton = $('#callback-button');
-  if (phone && callbackButton) callbackButton.onclick = () => initiateCall(contact);
+  const phones = asArray(contact.phone_numbers);
+  $('#content').innerHTML = `<div class="grid-2 contact-detail-layout"><div class="panel"><h2>История звонков</h2>${callRows(asArray(contact.calls))}</div><div><section class="panel contact-summary"><h2>Контакт</h2><p class="phone">${esc(contact.full_name || 'Без имени')}</p>${contact.email ? `<p class="muted">${esc(contact.email)}</p>` : ''}${contact.notes ? `<p class="contact-notes">${esc(contact.notes)}</p>` : ''}</section><section class="panel contact-phone-panel"><div class="panel-head"><h2>Номера для связи</h2><span class="muted">Выберите, куда позвонить</span></div><div class="contact-phone-list">${phones.map(phone => contactPhoneRow(contact, phone)).join('') || '<p class="muted">Номеров пока нет.</p>'}</div><form id="contact-phone-form" class="form compact-form contact-phone-form"><h3>Добавить номер</h3><label>Номер<input name="phone" required maxlength="50" inputmode="tel" autocomplete="tel" placeholder="+7 999 123-45-67"></label><label>Подпись<input name="label" required maxlength="80" value="Дополнительный" placeholder="Например, помощник Елена"></label><label>Кому принадлежит<select name="role"><option value="assistant">Помощник</option><option value="customer">Клиент</option><option value="other" selected>Другой контакт</option></select></label><label class="check-label"><input type="checkbox" name="make_primary"> Сделать основным номером</label><p id="contact-phone-error" class="form-error" role="alert"></p><button class="secondary" type="submit">Добавить номер</button></form></section><section class="panel"><h2>Сделки</h2>${asArray(contact.deals).map(deal => `<a class="task-row deal-link" href="${dealHash(deal.id, `contact:${id}`)}" data-deal-id="${esc(deal.id)}" data-deal-context="contact:${esc(id)}"><div><b>${esc(deal.title)}</b><small>${money(deal.amount)}</small><small class="deal-open-affordance">Открыть сделку →</small></div><span class="badge">${esc(deal.stage)}</span></a>`).join('') || '<p class="muted">Сделок нет</p>'}</section></div></div>`;
+  if (contact.can_write === false) {
+    const form = $('#contact-phone-form');
+    if (form) {
+      const notice = document.createElement('p');
+      notice.className = 'muted';
+      notice.textContent = 'У вас есть доступ к истории, но изменять номера и выполнять callback может ответственный менеджер.';
+      form.replaceWith(notice);
+    }
+  } else {
+    bindContactPhoneForm(id);
+  }
 }
 
 async function deals() {

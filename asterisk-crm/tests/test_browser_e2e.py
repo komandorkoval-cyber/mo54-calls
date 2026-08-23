@@ -49,6 +49,10 @@ API = ROOT / "api"
 STATIC = API / "static"
 DEAL_ID = "f8f939d4-152d-4d20-b1d5-52aeb6318db8"
 CONTACT_ID = "cc440ed8-e157-4b1d-95ab-f9bd6ccf1d2f"
+PRIMARY_PHONE_ID = "914e9234-0cb5-4ca9-b9b8-eb0e3012e5d5"
+MANUAL_CONTACT_ID = "a4a6d342-7564-45fc-99ce-3163d9079d5a"
+MANUAL_PRIMARY_PHONE_ID = "9ac38e5f-065f-4994-bc2f-fccb474a0911"
+MANUAL_ASSISTANT_PHONE_ID = "bfab68a1-8fb9-4f7e-b9fa-2f9c67e98791"
 
 
 def chrome_binary() -> str | None:
@@ -304,6 +308,18 @@ class ChromeBrowser:
         self._cdp().command("Input.dispatchMouseEvent", {"type": "mousePressed", **rect, "button": "left", "clickCount": 1})
         self._cdp().command("Input.dispatchMouseEvent", {"type": "mouseReleased", **rect, "button": "left", "clickCount": 1})
 
+    def fill(self, selector: str, value: str) -> None:
+        """Enter text through Chrome's input channel, then submit with a native click."""
+
+        self.click(selector)
+        self.evaluate(
+            "(() => {"
+            f"const element = document.querySelector({json.dumps(selector)});"
+            "element.value = ''; element.dispatchEvent(new Event('input', {bubbles:true}));"
+            "})()"
+        )
+        self._cdp().command("Input.insertText", {"text": value})
+
     def viewport(self, width: int, height: int, *, mobile: bool) -> None:
         self._cdp().command(
             "Emulation.setDeviceMetricsOverride",
@@ -323,7 +339,26 @@ class BrowserFixture:
     def __init__(self):
         self.fail_detail = False
         self.fail_cashflow = False
+        self.fail_contact_detail_once = False
+        self.callback_returns_call_id_immediately = True
         self.requests: list[str] = []
+        self.post_bodies: list[tuple[str, dict[str, Any]]] = []
+        self.contacts: dict[str, dict[str, Any]] = {
+            CONTACT_ID: {
+                "id": CONTACT_ID,
+                "full_name": "Browser Client",
+                "phone_normalized": "+79990001122",
+                "email": None,
+                "notes": None,
+                "calls": [],
+                "deals": [],
+                "phone_numbers": [{
+                    "id": PRIMARY_PHONE_ID, "contact_id": CONTACT_ID,
+                    "phone_normalized": "+79990001122", "label": "Основной",
+                    "role": "customer", "is_primary": True, "active": True,
+                }],
+            },
+        }
         self._server: http.server.ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -352,6 +387,32 @@ class BrowserFixture:
 
             def _json(self, body: Any, status: int = 200) -> None:
                 self._send(status, json.dumps(body, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+
+            def _request_json(self) -> dict[str, Any]:
+                raw_size = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(raw_size) if raw_size else b"{}"
+                try:
+                    value = json.loads(raw.decode("utf-8"))
+                except json.JSONDecodeError:
+                    value = {}
+                return value if isinstance(value, dict) else {}
+
+            def _contact_list(self) -> list[dict[str, Any]]:
+                return [{
+                    "id": contact["id"], "full_name": contact.get("full_name"),
+                    "phone_normalized": contact.get("phone_normalized"), "email": contact.get("email"),
+                    "calls_count": len(contact.get("calls") or []), "last_call_at": None,
+                } for contact in fixture.contacts.values()]
+
+            def _contact_detail(self, contact_id: str) -> dict[str, Any] | None:
+                contact = fixture.contacts.get(contact_id)
+                if not contact:
+                    return None
+                detail = dict(contact)
+                detail["phone_numbers"] = list(contact.get("phone_numbers") or [])
+                detail["calls"] = list(contact.get("calls") or [])
+                detail["deals"] = [self.deal_card()] if contact_id == CONTACT_ID else list(contact.get("deals") or [])
+                return detail
 
             def _asset_path(self, url_path: str) -> Path | None:
                 name = Path(url_path).name
@@ -390,6 +451,12 @@ class BrowserFixture:
                 if request_path == "/api/calls":
                     self._json([])
                     return
+                if request_path.startswith("/api/calls/initiations/"):
+                    body = {"id": request_path.rsplit("/", 1)[-1], "status": "accepted"}
+                    if fixture.callback_returns_call_id_immediately:
+                        body["call_id"] = 42
+                    self._json(body)
+                    return
                 if request_path == "/api/tasks":
                     self._json([])
                     return
@@ -403,10 +470,18 @@ class BrowserFixture:
                     self._json([self.deal_card()])
                     return
                 if request_path == "/api/contacts":
-                    self._json([{"id": CONTACT_ID, "full_name": "Browser Client", "phone_normalized": "+79990001122", "email": None, "calls_count": 0, "last_call_at": None}])
+                    self._json(self._contact_list())
                     return
-                if request_path == f"/api/contacts/{CONTACT_ID}":
-                    self._json({"id": CONTACT_ID, "full_name": "Browser Client", "phone_normalized": "+79990001122", "calls": [], "deals": [self.deal_card()]})
+                if request_path.startswith("/api/contacts/"):
+                    if fixture.fail_contact_detail_once:
+                        fixture.fail_contact_detail_once = False
+                        self._json({"detail": "temporary contact refresh failure"}, 500)
+                        return
+                    detail = self._contact_detail(request_path.rsplit("/", 1)[-1])
+                    if detail:
+                        self._json(detail)
+                    else:
+                        self._json({"detail": "contact not found"}, 404)
                     return
                 if request_path == f"/api/deals/{DEAL_ID}":
                     if fixture.fail_detail:
@@ -421,6 +496,49 @@ class BrowserFixture:
                         self._json({"confirmed_customer_cash": 0, "refunds": 0, "net_confirmed_customer_cash": 0, "realized_costs": 0, "open_obligations": 0, "other_reserved_cash": 0, "safe_cash": 0, "movements": [], "obligations": []})
                     return
                 self._json({"detail": f"Unhandled browser fixture route: {request_path}"}, 404)
+
+            def do_POST(self) -> None:  # noqa: N802 - stdlib handler name.
+                request_path = urllib.parse.urlparse(self.path).path
+                body = self._request_json()
+                fixture.requests.append(request_path)
+                fixture.post_bodies.append((request_path, body))
+                if request_path == "/api/contacts":
+                    contact = {
+                        "id": MANUAL_CONTACT_ID,
+                        "full_name": body.get("full_name") or "Manual browser client",
+                        "phone_normalized": "+79992223344",
+                        "email": body.get("email"), "notes": body.get("notes"),
+                        "calls": [], "deals": [],
+                        "phone_numbers": [{
+                            "id": MANUAL_PRIMARY_PHONE_ID, "contact_id": MANUAL_CONTACT_ID,
+                            "phone_normalized": "+79992223344", "label": "Основной",
+                            "role": "customer", "is_primary": True, "active": True,
+                        }],
+                    }
+                    fixture.contacts[MANUAL_CONTACT_ID] = contact
+                    self._json({**contact, "phone_numbers": list(contact["phone_numbers"])}, 201)
+                    return
+                phone_prefix = f"/api/contacts/{MANUAL_CONTACT_ID}/phone-numbers"
+                if request_path == phone_prefix:
+                    contact = fixture.contacts.get(MANUAL_CONTACT_ID)
+                    if not contact:
+                        self._json({"detail": "contact not found"}, 404)
+                        return
+                    phone = {
+                        "id": MANUAL_ASSISTANT_PHONE_ID, "contact_id": MANUAL_CONTACT_ID,
+                        "phone_normalized": "+79992223345", "label": body.get("label") or "Помощник",
+                        "role": body.get("role") or "assistant", "is_primary": False, "active": True,
+                    }
+                    contact["phone_numbers"] = [contact["phone_numbers"][0], phone]
+                    self._json(phone, 201)
+                    return
+                if request_path == "/api/calls/initiate":
+                    body = {"id": "c3d6ef2b-8f41-4ddf-9d04-9c09526c1cc8", "status": "accepted", "call_session_id": "browser-manual", "duplicate": False}
+                    if fixture.callback_returns_call_id_immediately:
+                        body["call_id"] = 42
+                    self._json(body)
+                    return
+                self._json({"detail": f"Unhandled browser fixture POST route: {request_path}"}, 404)
 
             @staticmethod
             def deal_card() -> dict[str, Any]:
@@ -513,6 +631,102 @@ class DealWorkspaceBrowserAcceptanceTests(unittest.TestCase):
             browser.click('[data-action="deal-back"]')
             browser.wait_for("document.querySelector('#title')?.textContent.includes('Browser Client')")
             self.assertIn("Browser terrace deal", browser.text("#content"))
+
+    def test_mobile_manager_can_create_client_add_assistant_and_call_selected_number(self) -> None:
+        with browser_session() as (fixture, browser):
+            browser.viewport(390, 844, mobile=True)
+            browser.goto(fixture.url + "/")
+            browser.wait_for("document.querySelector('#workspace') && !document.querySelector('#workspace').classList.contains('hidden')")
+            browser.click('button[data-view="contacts"]')
+            browser.wait_for("document.querySelector('#title')?.textContent.includes('Клиенты') && Boolean(document.querySelector('[data-action=\"contact-create-open\"]'))")
+            browser.click('[data-action="contact-create-open"]')
+            browser.fill('#contact-create-form input[name="full_name"]', 'Manual browser client')
+            browser.fill('#contact-create-form input[name="phone"]', '+7 999 222-33-44')
+            browser.click('#contact-create-form button[type="submit"]')
+            browser.wait_for("document.querySelector('#title')?.textContent.includes('Manual browser client')")
+            created_payloads = [body for path, body in fixture.post_bodies if path == '/api/contacts']
+            self.assertEqual(created_payloads, [{
+                'full_name': 'Manual browser client',
+                'phone': '+7 999 222-33-44',
+                'email': None,
+                'notes': None,
+            }])
+            browser.wait_for("Boolean(document.querySelector('#contact-phone-form'))")
+            phone_panel_layout = browser.evaluate(
+                "(() => ({"
+                "phones: document.querySelector('.contact-phone-panel')?.getBoundingClientRect().top,"
+                "history: Array.from(document.querySelectorAll('.contact-detail-layout .panel'))"
+                ".find((panel) => panel.querySelector('h2')?.textContent.includes('История звонков'))"
+                "?.getBoundingClientRect().top"
+                "}))()"
+            )
+            self.assertLess(phone_panel_layout['phones'], phone_panel_layout['history'])
+            browser.fill('#contact-phone-form input[name="phone"]', '+7 999 222-33-45')
+            browser.fill('#contact-phone-form input[name="label"]', 'Помощник Ольга')
+            browser.click('#contact-phone-form button[type="submit"]')
+            assistant_button = f'[data-action="contact-phone-call"][data-phone-number-id="{MANUAL_ASSISTANT_PHONE_ID}"]'
+            browser.wait_for(f"Boolean(document.querySelector({json.dumps(assistant_button)}))")
+            self.assertIn('Помощник Ольга', browser.text('#content'))
+            added_payloads = [body for path, body in fixture.post_bodies if path.endswith('/phone-numbers')]
+            self.assertEqual(added_payloads, [{
+                'phone': '+7 999 222-33-45',
+                'label': 'Помощник Ольга',
+                'role': 'other',
+                'make_primary': False,
+            }])
+            fixture.callback_returns_call_id_immediately = False
+            browser.click(assistant_button)
+            browser.wait_for(
+                "Array.from(document.querySelectorAll('.callback-status')).some((node) => "
+                "node.textContent.includes('Novofon'))",
+                message="Selected assistant phone did not enter the protected callback UI flow",
+            )
+            initiated = [body for path, body in fixture.post_bodies if path == '/api/calls/initiate']
+            self.assertEqual(len(initiated), 1)
+            self.assertEqual(initiated[0]['contact_id'], MANUAL_CONTACT_ID)
+            self.assertEqual(initiated[0]['contact_phone_number_id'], MANUAL_ASSISTANT_PHONE_ID)
+            self.assertTrue(initiated[0]['idempotency_key'])
+            self.assertTrue(any(path.startswith('/api/calls/initiations/') for path in fixture.requests))
+            layout = browser.evaluate(
+                "(() => {"
+                f"const button = document.querySelector({json.dumps(assistant_button)});"
+                "const row = button.closest('.contact-phone-row');"
+                "return {buttonWidth:Math.round(button.getBoundingClientRect().width),rowWidth:Math.round(row.getBoundingClientRect().width)};"
+                "})()"
+            )
+            self.assertGreaterEqual(layout['buttonWidth'], 300)
+            self.assertGreaterEqual(layout['rowWidth'], layout['buttonWidth'])
+
+    def test_read_only_contact_does_not_mislabel_active_number_as_disabled(self) -> None:
+        with browser_session() as (fixture, browser):
+            fixture.contacts[CONTACT_ID]['can_write'] = False
+            browser.viewport(390, 844, mobile=True)
+            browser.goto(fixture.url + "/")
+            browser.wait_for("document.querySelector('#workspace') && !document.querySelector('#workspace').classList.contains('hidden')")
+            browser.click('button[data-view="contacts"]')
+            browser.click(f'[data-action="contact-detail"][data-contact-id="{CONTACT_ID}"]')
+            browser.wait_for("Boolean(document.querySelector('.contact-phone-row'))")
+            self.assertIn('Только просмотр', browser.text('.contact-phone-row'))
+            self.assertNotIn('Номер отключён', browser.text('.contact-phone-row'))
+            self.assertFalse(browser.exists('[data-action="contact-phone-call"]'))
+
+    def test_saved_manual_client_is_not_reported_as_unsaved_when_detail_refresh_fails(self) -> None:
+        with browser_session() as (fixture, browser):
+            browser.viewport(390, 844, mobile=True)
+            browser.goto(fixture.url + "/")
+            browser.wait_for("document.querySelector('#workspace') && !document.querySelector('#workspace').classList.contains('hidden')")
+            browser.click('button[data-view="contacts"]')
+            browser.wait_for("Boolean(document.querySelector('[data-action=\"contact-create-open\"]'))")
+            browser.click('[data-action="contact-create-open"]')
+            browser.fill('#contact-create-form input[name="full_name"]', 'Refresh-safe client')
+            browser.fill('#contact-create-form input[name="phone"]', '+7 999 222-33-44')
+            fixture.fail_contact_detail_once = True
+            browser.click('#contact-create-form button[type="submit"]')
+            browser.wait_for("document.querySelector('#contact-create-error.saved')?.textContent.includes('Клиент сохранён')")
+            self.assertTrue(browser.exists('[data-contact-refresh-retry="true"]'))
+            self.assertEqual('Клиенты', browser.text('#title').strip())
+            browser.click('[data-contact-refresh-retry="true"]')
+            browser.wait_for("document.querySelector('#title')?.textContent.includes('Refresh-safe client')")
 
     def test_mobile_navigation_exposes_four_primary_sections_and_more_sheet(self) -> None:
         with browser_session() as (fixture, browser):

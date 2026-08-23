@@ -20,6 +20,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
+from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from pwdlib import PasswordHash
@@ -218,9 +219,11 @@ def set_session_cookie(response: Response, token: str, expires: datetime) -> Non
 
 def reserve_novofon_initiation(
     *,
+    audit_user: Any,
     user_id: UUID,
     mapping_id: UUID,
     contact_id: UUID | None,
+    contact_phone_number_id: UUID | None,
     deal_id: UUID | None,
     from_number: str,
     to_number: str,
@@ -266,9 +269,9 @@ def reserve_novofon_initiation(
         cur.execute(
             """INSERT INTO call_initiation_requests(
                    id, source, provider, idempotency_key, provider_request_id,
-                   requested_by_user_id, employee_mapping_id, contact_id, deal_id,
+                   requested_by_user_id, employee_mapping_id, contact_id, contact_phone_number_id, deal_id,
                    from_number, to_number, status, intent
-               ) VALUES(%s,'novofon','novofon',%s,%s,%s,%s,%s,%s,%s,%s,'requested',%s::jsonb)
+               ) VALUES(%s,'novofon','novofon',%s,%s,%s,%s,%s,%s,%s,%s,%s,'requested',%s::jsonb)
                RETURNING id, status, call_session_id, call_id""",
             (
                 request_id,
@@ -277,13 +280,33 @@ def reserve_novofon_initiation(
                 user_id,
                 mapping_id,
                 contact_id,
+                contact_phone_number_id,
                 deal_id,
                 from_number,
                 to_number,
-                json.dumps({"created_from": "crm", "contact_id": str(contact_id or "")}, ensure_ascii=False),
+                json.dumps({
+                    "created_from": "crm",
+                    "contact_id": str(contact_id or ""),
+                    "contact_phone_number_id": str(contact_phone_number_id or ""),
+                }, ensure_ascii=False),
             ),
         )
         created = dict(cur.fetchone())
+        audit_in_transaction(
+            cur,
+            audit_user,
+            "call_initiation",
+            str(request_id),
+            "create",
+            None,
+            {
+                "status": created["status"],
+                "contact_id": str(contact_id or ""),
+                "contact_phone_number_id": str(contact_phone_number_id or ""),
+                "deal_id": str(deal_id or ""),
+                "to_number": to_number,
+            },
+        )
         conn.commit()
     return created, False
 
@@ -576,14 +599,86 @@ class TaskPatch(BaseModel):
     status: Literal["open", "completed", "cancelled"] | None = None
 
 
+class ContactCreate(BaseModel):
+    full_name: str = Field(min_length=1, max_length=200)
+    phone: str = Field(min_length=3, max_length=50)
+    email: str | None = Field(None, max_length=254)
+    notes: str | None = Field(None, max_length=5000)
+
+    @model_validator(mode="after")
+    def normalize_text(self):
+        self.full_name = self.full_name.strip()
+        if not self.full_name:
+            raise ValueError("Укажите имя клиента")
+        self.email = self.email.strip() if self.email else None
+        self.notes = self.notes.strip() if self.notes else None
+        return self
+
+
+class ContactPatch(BaseModel):
+    full_name: str | None = Field(None, min_length=1, max_length=200)
+    email: str | None = Field(None, max_length=254)
+    notes: str | None = Field(None, max_length=5000)
+
+    @model_validator(mode="after")
+    def has_change(self):
+        if not self.model_fields_set:
+            raise ValueError("Нет изменений клиента")
+        if self.full_name is not None:
+            self.full_name = self.full_name.strip()
+            if not self.full_name:
+                raise ValueError("Укажите имя клиента")
+        if self.email is not None:
+            self.email = self.email.strip() or None
+        if self.notes is not None:
+            self.notes = self.notes.strip() or None
+        return self
+
+
+class ContactPhoneNumberCreate(BaseModel):
+    phone: str = Field(min_length=3, max_length=50)
+    label: str = Field("Дополнительный", min_length=1, max_length=80)
+    role: Literal["customer", "assistant", "other"] = "other"
+    make_primary: bool = False
+
+    @model_validator(mode="after")
+    def normalize_text(self):
+        self.label = self.label.strip()
+        if not self.label:
+            raise ValueError("Укажите подпись номера")
+        return self
+
+
+class ContactPhoneNumberPatch(BaseModel):
+    label: str | None = Field(None, min_length=1, max_length=80)
+    role: Literal["customer", "assistant", "other"] | None = None
+    is_primary: bool | None = None
+    active: bool | None = None
+
+    @model_validator(mode="after")
+    def has_change(self):
+        if not self.model_fields_set:
+            raise ValueError("Нет изменений номера")
+        if self.label is not None:
+            self.label = self.label.strip()
+            if not self.label:
+                raise ValueError("Укажите подпись номера")
+        return self
+
+
 class CallInitiate(BaseModel):
     contact_id: UUID | None = None
+    contact_phone_number_id: UUID | None = None
     phone: str | None = Field(None, max_length=50)
     deal_id: UUID | None = None
     idempotency_key: str | None = Field(None, min_length=8, max_length=200)
 
     @model_validator(mode="after")
     def contact_or_phone(self):
+        if self.contact_phone_number_id and not self.contact_id:
+            raise ValueError("Выбранный номер должен принадлежать клиенту")
+        if self.contact_phone_number_id and self.phone:
+            raise ValueError("Передавайте либо сохранённый номер клиента, либо отдельный номер")
         if not self.contact_id and not self.phone:
             raise ValueError("Нужен контакт или номер телефона")
         return self
@@ -758,12 +853,39 @@ def require_contact_access(contact_id: UUID, user: User) -> None:
         return
     row = fetch_one(
         """SELECT 1
-           WHERE EXISTS(SELECT 1 FROM calls WHERE contact_id=%s AND owner_id=%s)
+           WHERE EXISTS(SELECT 1 FROM contacts WHERE id=%s AND owner_id=%s)
+              OR EXISTS(SELECT 1 FROM calls WHERE contact_id=%s AND owner_id=%s)
               OR EXISTS(SELECT 1 FROM deals WHERE contact_id=%s AND owner_id=%s)
               OR EXISTS(SELECT 1 FROM tasks WHERE contact_id=%s AND assignee_id=%s)""",
-        (contact_id, user.id, contact_id, user.id, contact_id, user.id),
+        (contact_id, user.id, contact_id, user.id, contact_id, user.id, contact_id, user.id),
     )
     if not row:
+        raise HTTPException(404, "Контакт не найден")
+
+
+def has_contact_write_access(contact_id: UUID, user: User) -> bool:
+    """Whether a user may change a contact or initiate a real callback.
+
+    A task assignment grants visibility so a manager can read the context for
+    their work, but it must not silently grant authority to change another
+    manager's customer profile or place a provider call on their behalf.
+    """
+
+    if user.role == "admin":
+        return True
+    row = fetch_one(
+        """SELECT 1
+           WHERE EXISTS(SELECT 1 FROM contacts WHERE id=%s AND owner_id=%s)
+              OR EXISTS(SELECT 1 FROM calls WHERE contact_id=%s AND owner_id=%s)
+              OR EXISTS(SELECT 1 FROM deals WHERE contact_id=%s AND owner_id=%s)""",
+        (contact_id, user.id, contact_id, user.id, contact_id, user.id),
+    )
+    return bool(row)
+
+
+def require_contact_write_access(contact_id: UUID, user: User) -> None:
+    if not has_contact_write_access(contact_id, user):
+        # Match the existing non-disclosing ownership policy.
         raise HTTPException(404, "Контакт не найден")
 
 
@@ -1314,20 +1436,26 @@ def patch_call(call_id: int, body: CallPatch, user: User = Depends(current_user)
         if not target_contact:
             raise HTTPException(404, "Контакт не найден")
         if user.role != "admin":
-            require_contact_access(body.contact_id, user)
+            require_contact_write_access(body.contact_id, user)
     if contact_id and any(value is not None for value in (body.contact_name, body.contact_email, body.contact_notes)):
         if user.role != "admin":
-            require_contact_access(contact_id, user)
+            require_contact_write_access(contact_id, user)
         execute(
             """UPDATE contacts SET full_name=coalesce(%s,full_name), email=coalesce(%s,email),
                notes=coalesce(%s,notes), updated_at=now() WHERE id=%s RETURNING id""",
             (body.contact_name, body.contact_email, body.contact_notes, contact_id),
         )
     after = execute(
-        """UPDATE calls SET contact_id=coalesce(%s,contact_id), owner_id=coalesce(%s,owner_id),
+        """UPDATE calls
+           SET contact_id=coalesce(%s,contact_id),
+               contact_phone_number_id=CASE
+                   WHEN %s::uuid IS NOT NULL AND %s::uuid IS DISTINCT FROM contact_id THEN NULL
+                   ELSE contact_phone_number_id
+               END,
+               owner_id=coalesce(%s,owner_id),
            updated_at=now() WHERE id=%s
-           RETURNING id, call_id, source, contact_id, owner_id, updated_at""",
-        (body.contact_id, body.owner_id, call_id),
+           RETURNING id, call_id, source, contact_id, contact_phone_number_id, owner_id, updated_at""",
+        (body.contact_id, body.contact_id, body.contact_id, body.owner_id, call_id),
     )
     audit(user, "call", str(call_id), "update", before, after)
     return after
@@ -1532,16 +1660,311 @@ def recording(recording_id: UUID, user: User = Depends(current_user)):
     return response
 
 
+def canonical_contact_phone(cursor: Any, phone: str) -> tuple[str, str]:
+    """Return the CRM identity key and the public E.164 display form.
+
+    Novofon deliberately uses digits without a plus sign at its API boundary;
+    phone numbers persisted in CRM use this database-owned canonicalization so
+    incoming Asterisk and Novofon events resolve to exactly the same contact.
+    """
+
+    cursor.execute("SELECT canonical_contact_phone(%s) AS phone_key", (phone,))
+    row = cursor.fetchone()
+    phone_key = str((row or {}).get("phone_key") or "")
+    if not phone_key:
+        raise HTTPException(422, "Укажите корректный номер телефона")
+    return phone_key, f"+{phone_key}"
+
+
+def lock_contact_phone_key(cursor: Any, phone_key: str) -> None:
+    """Serialize API and provider creation of one canonical CRM phone key."""
+
+    cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (phone_key,))
+
+
+@app.post("/api/contacts", status_code=201)
+def create_contact(body: ContactCreate, user: User = Depends(current_user)):
+    """Create a manually entered client together with its immutable primary phone."""
+
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            phone_key, phone_normalized = canonical_contact_phone(cur, body.phone)
+            lock_contact_phone_key(cur, phone_key)
+            cur.execute(
+                """SELECT 1
+                   FROM contact_phone_numbers pn
+                   WHERE pn.phone_key=%s
+                   UNION ALL
+                   SELECT 1 FROM contacts ct
+                   WHERE canonical_contact_phone(ct.phone_normalized)=%s
+                   LIMIT 1""",
+                (phone_key, phone_key),
+            )
+            if cur.fetchone():
+                raise HTTPException(409, "Этот номер уже закреплён за клиентом")
+            cur.execute(
+                """INSERT INTO contacts(full_name, phone_normalized, phone_raw, email, notes, owner_id)
+                   VALUES(%s,%s,%s,%s,%s,%s)
+                   RETURNING *""",
+                (body.full_name, phone_normalized, body.phone, body.email, body.notes, user.id),
+            )
+            contact_row = dict(cur.fetchone())
+            cur.execute(
+                """INSERT INTO contact_phone_numbers(
+                       contact_id, phone_key, phone_normalized, phone_raw,
+                       label, role, is_primary, active, created_by_user_id
+                   ) VALUES(%s,%s,%s,%s,'Основной','customer',true,true,%s)
+                   RETURNING *""",
+                (contact_row["id"], phone_key, phone_normalized, body.phone, user.id),
+            )
+            phone_row = dict(cur.fetchone())
+            contact_row["phone_numbers"] = [phone_row]
+            audit_in_transaction(
+                cur, user, "contact_phone_number", str(phone_row["id"]), "create", None, phone_row
+            )
+            audit_in_transaction(cur, user, "contact", str(contact_row["id"]), "create", None, contact_row)
+            conn.commit()
+            return contact_row
+    except UniqueViolation as exc:
+        raise HTTPException(409, "Этот номер уже закреплён за клиентом") from exc
+
+
+@app.patch("/api/contacts/{contact_id}")
+def update_contact(contact_id: UUID, body: ContactPatch, user: User = Depends(current_user)):
+    require_contact_write_access(contact_id, user)
+    values = body.model_dump(exclude_unset=True)
+    allowed = {"full_name", "email", "notes"}
+    values = {name: value for name, value in values.items() if name in allowed}
+    if not values:
+        raise HTTPException(422, "Нет изменений клиента")
+    assignments = ", ".join(f"{name}=%s" for name in values)
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM contacts WHERE id=%s FOR UPDATE", (contact_id,))
+            before = cur.fetchone()
+            if not before:
+                raise HTTPException(404, "Контакт не найден")
+            cur.execute(
+                f"UPDATE contacts SET {assignments}, updated_at=now() WHERE id=%s RETURNING *",
+                (*values.values(), contact_id),
+            )
+            after = dict(cur.fetchone())
+            audit_in_transaction(cur, user, "contact", str(contact_id), "update", dict(before), after)
+            conn.commit()
+            return after
+    except UniqueViolation as exc:
+        raise HTTPException(409, "Не удалось сохранить клиента") from exc
+
+
+@app.post("/api/contacts/{contact_id}/phone-numbers", status_code=201)
+def add_contact_phone_number(contact_id: UUID, body: ContactPhoneNumberCreate, user: User = Depends(current_user)):
+    require_contact_write_access(contact_id, user)
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            phone_key, phone_normalized = canonical_contact_phone(cur, body.phone)
+            lock_contact_phone_key(cur, phone_key)
+            cur.execute("SELECT * FROM contacts WHERE id=%s FOR UPDATE", (contact_id,))
+            contact_before_row = cur.fetchone()
+            if not contact_before_row:
+                raise HTTPException(404, "Контакт не найден")
+            contact_before = dict(contact_before_row)
+            cur.execute(
+                """SELECT 1
+                   FROM contact_phone_numbers
+                   WHERE phone_key=%s
+                   UNION ALL
+                   SELECT 1 FROM contacts
+                   WHERE canonical_contact_phone(phone_normalized)=%s
+                   LIMIT 1""",
+                (phone_key, phone_key),
+            )
+            if cur.fetchone():
+                raise HTTPException(409, "Этот номер уже закреплён за клиентом")
+            demoted_before: dict[str, Any] | None = None
+            demoted_after: dict[str, Any] | None = None
+            contact_after: dict[str, Any] | None = None
+            if body.make_primary:
+                cur.execute(
+                    """SELECT * FROM contact_phone_numbers
+                       WHERE contact_id=%s AND is_primary
+                       FOR UPDATE""",
+                    (contact_id,),
+                )
+                old_primary = cur.fetchone()
+                demoted_before = dict(old_primary) if old_primary else None
+                cur.execute(
+                    """UPDATE contact_phone_numbers
+                       SET is_primary=false, updated_at=now()
+                       WHERE contact_id=%s AND is_primary
+                       RETURNING *""",
+                    (contact_id,),
+                )
+                demoted_row = cur.fetchone()
+                demoted_after = dict(demoted_row) if demoted_row else None
+            cur.execute(
+                """INSERT INTO contact_phone_numbers(
+                       contact_id, phone_key, phone_normalized, phone_raw,
+                       label, role, is_primary, active, created_by_user_id
+                   ) VALUES(%s,%s,%s,%s,%s,%s,%s,true,%s)
+                   RETURNING *""",
+                (
+                    contact_id, phone_key, phone_normalized, body.phone,
+                    body.label, body.role, body.make_primary, user.id,
+                ),
+            )
+            after = dict(cur.fetchone())
+            if body.make_primary:
+                cur.execute(
+                    """UPDATE contacts SET phone_normalized=%s, phone_raw=%s, updated_at=now()
+                       WHERE id=%s
+                       RETURNING *""",
+                    (phone_normalized, body.phone, contact_id),
+                )
+                contact_after = dict(cur.fetchone())
+            if demoted_before and demoted_after:
+                audit_in_transaction(
+                    cur, user, "contact_phone_number", str(demoted_after["id"]), "demote_primary",
+                    demoted_before, demoted_after,
+                )
+            if contact_after:
+                audit_in_transaction(
+                    cur, user, "contact", str(contact_id), "primary_phone_changed",
+                    contact_before, contact_after,
+                )
+            audit_in_transaction(cur, user, "contact_phone_number", str(after["id"]), "create", None, after)
+            conn.commit()
+            return after
+    except UniqueViolation as exc:
+        raise HTTPException(409, "Этот номер уже закреплён за клиентом") from exc
+
+
+@app.patch("/api/contacts/{contact_id}/phone-numbers/{phone_number_id}")
+def update_contact_phone_number(
+    contact_id: UUID,
+    phone_number_id: UUID,
+    body: ContactPhoneNumberPatch,
+    user: User = Depends(current_user),
+):
+    """Change phone metadata or primary/active state, never the historical number itself."""
+
+    require_contact_write_access(contact_id, user)
+    requested = body.model_dump(exclude_unset=True)
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            # Lock the parent first, matching the add-number path.  It
+            # serializes primary switches for one client and gives the audit
+            # trail one coherent before/after contact projection.
+            cur.execute("SELECT * FROM contacts WHERE id=%s FOR UPDATE", (contact_id,))
+            contact_before_row = cur.fetchone()
+            if not contact_before_row:
+                raise HTTPException(404, "Контакт не найден")
+            contact_before = dict(contact_before_row)
+            cur.execute(
+                """SELECT * FROM contact_phone_numbers
+                   WHERE id=%s AND contact_id=%s FOR UPDATE""",
+                (phone_number_id, contact_id),
+            )
+            before_row = cur.fetchone()
+            if not before_row:
+                raise HTTPException(404, "Номер клиента не найден")
+            before = dict(before_row)
+            requested_primary = requested.get("is_primary")
+            requested_active = requested.get("active")
+            if requested_primary is False and before["is_primary"]:
+                raise HTTPException(422, "У клиента должен оставаться основной номер")
+            if requested_active is False and before["is_primary"]:
+                raise HTTPException(422, "Сначала назначьте другой номер основным")
+            if requested_primary is True and requested_active is False:
+                raise HTTPException(422, "Основной номер должен быть активен")
+            switch_primary = requested_primary is True and not before["is_primary"]
+            demoted_before: dict[str, Any] | None = None
+            demoted_after: dict[str, Any] | None = None
+            contact_after: dict[str, Any] | None = None
+            if switch_primary:
+                cur.execute(
+                    """SELECT * FROM contact_phone_numbers
+                       WHERE contact_id=%s AND id<>%s AND is_primary
+                       FOR UPDATE""",
+                    (contact_id, phone_number_id),
+                )
+                old_primary = cur.fetchone()
+                demoted_before = dict(old_primary) if old_primary else None
+                cur.execute(
+                    """UPDATE contact_phone_numbers
+                       SET is_primary=false, updated_at=now()
+                       WHERE contact_id=%s AND id<>%s AND is_primary
+                       RETURNING *""",
+                    (contact_id, phone_number_id),
+                )
+                demoted_row = cur.fetchone()
+                demoted_after = dict(demoted_row) if demoted_row else None
+                requested["is_primary"] = True
+                requested["active"] = True
+
+            allowed = {"label", "role", "is_primary", "active"}
+            values = {name: value for name, value in requested.items() if name in allowed}
+            if not values:
+                raise HTTPException(422, "Нет изменений номера")
+            assignments = ", ".join(f"{name}=%s" for name in values)
+            cur.execute(
+                f"""UPDATE contact_phone_numbers
+                       SET {assignments}, updated_at=now()
+                     WHERE id=%s AND contact_id=%s
+                     RETURNING *""",
+                (*values.values(), phone_number_id, contact_id),
+            )
+            after = dict(cur.fetchone())
+            if switch_primary:
+                cur.execute(
+                    """UPDATE contacts SET phone_normalized=%s, phone_raw=%s, updated_at=now()
+                       WHERE id=%s
+                       RETURNING *""",
+                    (after["phone_normalized"], after["phone_raw"], contact_id),
+                )
+                contact_after = dict(cur.fetchone())
+            if demoted_before and demoted_after:
+                audit_in_transaction(
+                    cur, user, "contact_phone_number", str(demoted_after["id"]), "demote_primary",
+                    demoted_before, demoted_after,
+                )
+            if contact_after:
+                audit_in_transaction(
+                    cur, user, "contact", str(contact_id), "primary_phone_changed",
+                    contact_before, contact_after,
+                )
+            audit_in_transaction(cur, user, "contact_phone_number", str(phone_number_id), "update", before, after)
+            conn.commit()
+            return after
+    except UniqueViolation as exc:
+        raise HTTPException(409, "Не удалось сохранить номер клиента") from exc
+
+
 @app.get("/api/contacts")
 def contacts(q: str | None = None, user: User = Depends(current_user)):
     needle = f"%{q or ''}%"
-    scope = "TRUE" if user.role == "admin" else "EXISTS(SELECT 1 FROM calls sc WHERE sc.contact_id=ct.id AND sc.owner_id=%s)"
-    params: tuple[Any, ...] = (needle, needle) if user.role == "admin" else (needle, needle, user.id)
+    if user.role == "admin":
+        scope = "TRUE"
+        params: tuple[Any, ...] = (needle, needle, needle)
+    else:
+        scope = """(
+            ct.owner_id=%s
+            OR EXISTS(SELECT 1 FROM calls sc WHERE sc.contact_id=ct.id AND sc.owner_id=%s)
+            OR EXISTS(SELECT 1 FROM deals sd WHERE sd.contact_id=ct.id AND sd.owner_id=%s)
+            OR EXISTS(SELECT 1 FROM tasks st WHERE st.contact_id=ct.id AND st.assignee_id=%s)
+        )"""
+        params = (needle, needle, needle, user.id, user.id, user.id, user.id)
     return fetch_all(
         f"""SELECT ct.*, count(c.id)::int AS calls_count, max(c.started_at) AS last_call_at
            FROM contacts ct LEFT JOIN calls c ON c.contact_id=ct.id
-           WHERE (coalesce(ct.full_name,'') ILIKE %s OR ct.phone_normalized ILIKE %s) AND {scope}
-           GROUP BY ct.id ORDER BY last_call_at DESC NULLS LAST LIMIT 200""",
+           WHERE (
+                 coalesce(ct.full_name,'') ILIKE %s
+                 OR ct.phone_normalized ILIKE %s
+                 OR EXISTS(
+                     SELECT 1 FROM contact_phone_numbers pn
+                     WHERE pn.contact_id=ct.id AND pn.phone_normalized ILIKE %s
+                 )
+           ) AND {scope}
+           GROUP BY ct.id ORDER BY last_call_at DESC NULLS LAST, ct.created_at DESC LIMIT 200""",
         params,
     )
 
@@ -1552,10 +1975,20 @@ def contact(contact_id: UUID, user: User = Depends(current_user)):
     row = fetch_one("SELECT * FROM contacts WHERE id=%s", (contact_id,))
     if not row:
         raise HTTPException(404, "Контакт не найден")
+    # Expose the server-side RBAC decision so a task-only reader does not see
+    # controls that would fail only after entering data.
+    row["can_write"] = has_contact_write_access(contact_id, user)
+    row["phone_numbers"] = fetch_all(
+        """SELECT id, contact_id, phone_normalized, phone_raw, label, role, is_primary, active, created_at, updated_at
+             FROM contact_phone_numbers WHERE contact_id=%s
+             ORDER BY active DESC, is_primary DESC, created_at ASC""",
+        (contact_id,),
+    )
     owner_clause = "" if user.role == "admin" else " AND owner_id=%s"
     owner_params: tuple[Any, ...] = (contact_id,) if user.role == "admin" else (contact_id, user.id)
     row["calls"] = fetch_all(
-        f"""SELECT id, call_id, source, direction, started_at, duration_sec, processing_status::text
+        f"""SELECT id, call_id, source, direction, started_at, duration_sec, processing_status::text,
+                   contact_phone_number_id
             FROM calls WHERE contact_id=%s{owner_clause} ORDER BY started_at DESC""",
         owner_params,
     )
@@ -1577,12 +2010,46 @@ async def initiate_call(
     idempotency_header: str | None = Header(None, alias="Idempotency-Key"),
 ):
     contact: dict[str, Any] | None = None
+    contact_phone_number: dict[str, Any] | None = None
     if body.contact_id:
-        require_contact_access(body.contact_id, user)
+        require_contact_write_access(body.contact_id, user)
         contact = fetch_one("SELECT id, phone_normalized FROM contacts WHERE id=%s", (body.contact_id,))
         if not contact:
             raise HTTPException(404, "Контакт не найден")
-    phone = normalize_phone(body.phone or (contact or {}).get("phone_normalized"))
+        if body.contact_phone_number_id:
+            contact_phone_number = fetch_one(
+                """SELECT id, contact_id, phone_normalized
+                   FROM contact_phone_numbers
+                   WHERE id=%s AND contact_id=%s AND active""",
+                (body.contact_phone_number_id, body.contact_id),
+            )
+            if not contact_phone_number:
+                raise HTTPException(404, "Активный номер клиента не найден")
+        else:
+            contact_phone_number = fetch_one(
+                """SELECT id, contact_id, phone_normalized
+                   FROM contact_phone_numbers
+                   WHERE contact_id=%s AND active AND is_primary
+                   LIMIT 1""",
+                (body.contact_id,),
+            )
+            if not contact_phone_number:
+                # Legacy callers that create only a contact_id remain usable
+                # during the rolling migration.  New UI always selects a
+                # persisted child number, so it cannot silently create a split
+                # contact for an arbitrary override.
+                contact_phone_number = {
+                    "id": None,
+                    "contact_id": body.contact_id,
+                    "phone_normalized": contact["phone_normalized"],
+                }
+        selected_phone = normalize_phone(contact_phone_number.get("phone_normalized"))
+        supplied_phone = normalize_phone(body.phone) if body.phone else None
+        if supplied_phone and supplied_phone != selected_phone:
+            raise HTTPException(422, "Добавьте этот номер в карточку клиента перед звонком")
+        phone = selected_phone
+    else:
+        phone = normalize_phone(body.phone)
     if not phone:
         raise HTTPException(422, "Укажите корректный номер клиента")
     if body.deal_id:
@@ -1615,9 +2082,11 @@ async def initiate_call(
         f"{user.id}:{supplied_idempotency_key}".encode("utf-8")
     ).hexdigest()
     reserved, duplicate = reserve_novofon_initiation(
+        audit_user=user,
         user_id=user.id,
         mapping_id=mapping["id"],
         contact_id=(contact or {}).get("id"),
+        contact_phone_number_id=(contact_phone_number or {}).get("id"),
         deal_id=body.deal_id,
         from_number=NOVOFON_VIRTUAL_NUMBER,
         to_number=phone,
@@ -1643,11 +2112,21 @@ async def initiate_call(
     except NovofonAPIError as exc:
         # Network uncertainty is not retried: Novofon might already be calling
         # the manager.  Events/reconciliation will resolve the final outcome.
-        execute(
-            """UPDATE call_initiation_requests SET status='unknown', last_error=%s,
-               updated_at=now() WHERE id=%s""",
-            (str(exc)[:1000], request_id),
-        )
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE call_initiation_requests SET status='unknown', last_error=%s,
+                   updated_at=now() WHERE id=%s
+                   RETURNING id, status, call_session_id, call_id""",
+                (str(exc)[:1000], request_id),
+            )
+            unknown = dict(cur.fetchone())
+            audit_in_transaction(
+                cur, user, "call_initiation", str(request_id), "provider_uncertain",
+                {"status": reserved["status"]},
+                {"status": unknown["status"], "contact_id": str((contact or {}).get("id") or ""),
+                 "contact_phone_number_id": str((contact_phone_number or {}).get("id") or ""), "to_number": phone},
+            )
+            conn.commit()
         raise HTTPException(502, "Не удалось подтвердить исходящий callback. Не нажимайте повторно: проверьте журнал звонков.")
 
     provider_result = result["result"]
@@ -1657,21 +2136,33 @@ async def initiate_call(
     request_params = dict(request_log.get("params") or {})
     request_params["access_token"] = "[redacted]"
     request_log["params"] = request_params
-    row = execute(
-        """UPDATE call_initiation_requests
-           SET status='accepted', call_session_id=%s, provider_status=%s,
-               provider_request=%s::jsonb, provider_response=%s::jsonb, accepted_at=now(), updated_at=now()
-           WHERE id=%s
-           RETURNING id, status, call_session_id, call_id""",
-        (
-            session,
-            str(provider_result.get("status") or "accepted"),
-            json.dumps(request_log, ensure_ascii=False),
-            json.dumps(result["response"], ensure_ascii=False),
-            request_id,
-        ),
-    )
-    audit(user, "call_initiation", str(request_id), "create", None, {"to_number": phone, "status": row["status"]})
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """UPDATE call_initiation_requests
+               SET status='accepted', call_session_id=%s, provider_status=%s,
+                   provider_request=%s::jsonb, provider_response=%s::jsonb, accepted_at=now(), updated_at=now()
+               WHERE id=%s
+               RETURNING id, status, call_session_id, call_id""",
+            (
+                session,
+                str(provider_result.get("status") or "accepted"),
+                json.dumps(request_log, ensure_ascii=False),
+                json.dumps(result["response"], ensure_ascii=False),
+                request_id,
+            ),
+        )
+        row = dict(cur.fetchone())
+        audit_in_transaction(
+            cur, user, "call_initiation", str(request_id), "accepted",
+            {"status": reserved["status"]},
+            {
+                "status": row["status"],
+                "contact_id": str((contact or {}).get("id") or ""),
+                "contact_phone_number_id": str((contact_phone_number or {}).get("id") or ""),
+                "to_number": phone,
+            },
+        )
+        conn.commit()
     return {"id": row["id"], "status": row["status"], "call_session_id": row["call_session_id"], "call_id": row["call_id"], "duplicate": False}
 
 

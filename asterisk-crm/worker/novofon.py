@@ -61,7 +61,10 @@ def normalize_phone(value: object) -> str | None:
         digits = "7" + digits
     elif len(digits) == 11 and digits[0] == "8":
         digits = "7" + digits[1:]
-    if len(digits) < 11:
+    # Match the CRM database canonical key exactly.  The provider may send an
+    # international 00 prefix, but neither side accepts extensions or values
+    # beyond the E.164 15-digit maximum as a customer identity.
+    if len(digits) < 11 or len(digits) > 15:
         return None
     return f"+{digits}"
 

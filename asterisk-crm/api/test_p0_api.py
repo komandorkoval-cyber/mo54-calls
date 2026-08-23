@@ -196,6 +196,34 @@ class CashflowWorkspaceMarkupTests(unittest.TestCase):
             self.assertIn(required, source)
 
 
+class ManualContactPhonePolicyTests(unittest.TestCase):
+    def test_selected_contact_phone_must_belong_to_a_contact_and_cannot_be_combined_with_raw_override(self):
+        contact_id, phone_id = uuid4(), uuid4()
+        payload = app.CallInitiate(contact_id=contact_id, contact_phone_number_id=phone_id)
+        self.assertEqual(payload.contact_id, contact_id)
+        self.assertEqual(payload.contact_phone_number_id, phone_id)
+        with self.assertRaises(app.ValidationError):
+            app.CallInitiate(contact_phone_number_id=phone_id)
+        with self.assertRaises(app.ValidationError):
+            app.CallInitiate(contact_id=contact_id, contact_phone_number_id=phone_id, phone="79991112233")
+
+    def test_contact_phone_rows_have_create_and_metadata_only_update_routes(self):
+        routes = {
+            (route.path, tuple(sorted(route.methods or [])))
+            for route in app.app.routes if "phone-numbers" in route.path
+        }
+        self.assertIn(("/api/contacts/{contact_id}/phone-numbers", ("POST",)), routes)
+        self.assertIn(("/api/contacts/{contact_id}/phone-numbers/{phone_number_id}", ("PATCH",)), routes)
+        self.assertNotIn(("/api/contacts/{contact_id}/phone-numbers/{phone_number_id}", ("DELETE",)), routes)
+
+    def test_manual_contact_and_phone_models_trim_human_labels(self):
+        contact = app.ContactCreate(full_name="  Анна  ", phone="8 999 111-22-33", email="  anna@example.test  ")
+        phone = app.ContactPhoneNumberCreate(phone="8 999 111-22-34", label="  Помощник  ", role="assistant")
+        self.assertEqual(contact.full_name, "Анна")
+        self.assertEqual(contact.email, "anna@example.test")
+        self.assertEqual(phone.label, "Помощник")
+
+
 def unknown_field(value=None):
     return {"proposed_value": value, "confidence": None, "evidence": [], "inference_status": "unknown"}
 

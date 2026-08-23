@@ -425,8 +425,8 @@ def _novofon_employee_mapping(cur, event: NovofonEvent) -> dict | None:
         """SELECT id, crm_user_id
            FROM provider_employee_mappings
            WHERE provider='novofon' AND active
-             AND ((%s IS NOT NULL AND provider_employee_id=%s)
-                  OR (%s IS NOT NULL AND provider_extension=%s))
+             AND ((%s::text IS NOT NULL AND provider_employee_id=%s)
+                  OR (%s::text IS NOT NULL AND provider_extension=%s))
            ORDER BY CASE WHEN provider_employee_id=%s THEN 0 ELSE 1 END,
                     updated_at DESC
            LIMIT 1""",
@@ -442,18 +442,25 @@ def _novofon_employee_mapping(cur, event: NovofonEvent) -> dict | None:
     return dict(row) if row else None
 
 
-def _novofon_initiation_mapping(cur, event: NovofonEvent) -> dict | None:
-    """Fallback owner for a CRM-created callback with a sparse provider event."""
+def _novofon_initiation_context(cur, event: NovofonEvent) -> dict | None:
+    """Return durable CRM context for a CRM-created callback.
+
+    Novofon events can be sparse and can arrive after an employee mapping was
+    changed.  The callback intent is therefore the authoritative association
+    for its selected client phone, while the live employee mapping remains the
+    preferred owner attribution when available.
+    """
 
     if not event.call_session_id and not event.external_id:
         return None
     cur.execute(
-        """SELECT pem.id, pem.crm_user_id
+        """SELECT pem.id, coalesce(pem.crm_user_id, cir.requested_by_user_id) AS crm_user_id,
+                  cir.contact_id, cir.contact_phone_number_id
            FROM call_initiation_requests cir
-           JOIN provider_employee_mappings pem ON pem.id=cir.employee_mapping_id
-           WHERE cir.source='novofon' AND pem.active
+           LEFT JOIN provider_employee_mappings pem ON pem.id=cir.employee_mapping_id
+           WHERE cir.source='novofon'
              AND (cir.call_session_id=%s
-                  OR (%s IS NOT NULL AND (cir.provider_request_id=%s OR cir.id::text=%s)))
+                  OR (%s::text IS NOT NULL AND (cir.provider_request_id=%s OR cir.id::text=%s)))
            ORDER BY cir.requested_at DESC
            LIMIT 1""",
         (
@@ -467,17 +474,32 @@ def _novofon_initiation_mapping(cur, event: NovofonEvent) -> dict | None:
     return dict(row) if row else None
 
 
+def _novofon_initiation_mapping(cur, event: NovofonEvent) -> dict | None:
+    """Compatibility wrapper for callers interested only in callback owner."""
+
+    return _novofon_initiation_context(cur, event)
+
+
 def _novofon_contact(cur, phone: str | None) -> str | None:
     if not phone:
         return None
     cur.execute(
-        """INSERT INTO contacts(phone_normalized, phone_raw)
-           VALUES(%s,%s)
-           ON CONFLICT(phone_normalized) DO UPDATE
-             SET phone_raw=coalesce(contacts.phone_raw, excluded.phone_raw),
-                 updated_at=now()
-           RETURNING id""",
+        "SELECT contact_for_phone(%s,%s) AS id",
         (phone, phone),
+    )
+    row = cur.fetchone()
+    return str(row["id"]) if row and row.get("id") else None
+
+
+def _novofon_contact_phone_number(cur, contact_id: str | None, phone: str | None) -> str | None:
+    if not contact_id or not phone:
+        return None
+    cur.execute(
+        """SELECT id
+             FROM contact_phone_numbers
+            WHERE contact_id=%s AND phone_key=canonical_contact_phone(%s)
+            LIMIT 1""",
+        (contact_id, phone),
     )
     row = cur.fetchone()
     return str(row["id"]) if row else None
@@ -502,6 +524,7 @@ def _upsert_novofon_call(
     event: NovofonEvent,
     payload: dict,
     contact_id: str | None,
+    contact_phone_number_id: str | None,
     owner_id: str | None,
 ) -> int:
     """Create/update the canonical call row for a Novofon call session."""
@@ -519,11 +542,11 @@ def _upsert_novofon_call(
     cur.execute(
         """INSERT INTO calls(
                  call_id, source, external_call_id, direction, caller_number,
-                 callee_number, contact_id, owner_id, started_at, ended_at,
+                 callee_number, contact_id, contact_phone_number_id, owner_id, started_at, ended_at,
                  duration_sec, answered, processing_status, processing_error,
                  raw_json, status
                ) VALUES(
-                 %s, 'novofon', %s, %s, %s, %s, %s, %s,
+                 %s, 'novofon', %s, %s, %s, %s, %s, %s, %s,
                  coalesce(%s, now()), coalesce(%s, now()), %s, %s, %s,
                  NULL, %s, %s
                )
@@ -534,6 +557,18 @@ def _upsert_novofon_call(
                  callee_number=CASE WHEN %s THEN coalesce(excluded.callee_number, calls.callee_number)
                                     ELSE calls.callee_number END,
                  contact_id=coalesce(calls.contact_id, excluded.contact_id),
+                 -- A human can deliberately reassign a call to another
+                 -- client.  Never reattach an incoming provider phone from
+                 -- the old client in that case; the database composite FK
+                 -- also enforces this parent/child identity invariant.
+                 contact_phone_number_id=CASE
+                     WHEN calls.contact_phone_number_id IS NOT NULL
+                         THEN calls.contact_phone_number_id
+                     WHEN calls.contact_id IS NULL
+                          OR calls.contact_id=excluded.contact_id
+                         THEN excluded.contact_phone_number_id
+                     ELSE NULL
+                 END,
                  owner_id=coalesce(calls.owner_id, excluded.owner_id),
                  started_at=CASE WHEN %s THEN excluded.started_at ELSE calls.started_at END,
                  ended_at=CASE WHEN %s THEN excluded.ended_at ELSE calls.ended_at END,
@@ -563,6 +598,7 @@ def _upsert_novofon_call(
             caller_number,
             callee_number,
             contact_id,
+            contact_phone_number_id,
             owner_id,
             event.started_at,
             event.occurred_at,
@@ -647,7 +683,7 @@ def _link_novofon_call_initiation(cur, event: NovofonEvent, call_id: int) -> Non
                updated_at=now()
            WHERE source='novofon'
              AND (call_session_id=%s
-                  OR (%s IS NOT NULL AND (provider_request_id=%s OR id::text=%s OR idempotency_key=%s)))""",
+                  OR (%s::text IS NOT NULL AND (provider_request_id=%s OR id::text=%s OR idempotency_key=%s)))""",
         (
             event.call_session_id,
             call_id,
@@ -712,11 +748,31 @@ def process_novofon_event(event_row: dict) -> dict:
         return {"ignored": True, "call_id": None, "employee_mapping_id": None}
 
     with connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        mapping = _novofon_employee_mapping(cur, event) or _novofon_initiation_mapping(cur, event)
-        mapping_id = str(mapping["id"]) if mapping else None
-        owner_id = str(mapping["crm_user_id"]) if mapping else None
-        contact_id = _novofon_contact(cur, event.contact_phone)
-        call_id = _upsert_novofon_call(cur, event, payload, contact_id, owner_id)
+        employee_mapping = _novofon_employee_mapping(cur, event)
+        initiation_context = _novofon_initiation_context(cur, event)
+        mapping = employee_mapping or initiation_context
+        mapping_id = str(mapping["id"]) if mapping and mapping.get("id") else None
+        owner_id = str(mapping["crm_user_id"]) if mapping and mapping.get("crm_user_id") else None
+        contact_id = str(initiation_context["contact_id"]) if initiation_context and initiation_context.get("contact_id") else None
+        contact_phone_number_id = (
+            str(initiation_context["contact_phone_number_id"])
+            if initiation_context and initiation_context.get("contact_phone_number_id") else None
+        )
+        if contact_id and contact_phone_number_id:
+            cur.execute(
+                """SELECT 1 FROM contact_phone_numbers
+                   WHERE id=%s AND contact_id=%s""",
+                (contact_phone_number_id, contact_id),
+            )
+            if not cur.fetchone():
+                contact_phone_number_id = None
+        if not contact_id:
+            contact_id = _novofon_contact(cur, event.contact_phone)
+        if not contact_phone_number_id:
+            contact_phone_number_id = _novofon_contact_phone_number(cur, contact_id, event.contact_phone)
+        call_id = _upsert_novofon_call(
+            cur, event, payload, contact_id, contact_phone_number_id, owner_id
+        )
         if event.event_type == "RECORD_CALL":
             _attach_novofon_recording(cur, event, payload, call_id, str(event_row["id"]))
         if event.event_type == "CALL_END":

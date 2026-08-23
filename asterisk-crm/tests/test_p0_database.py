@@ -29,6 +29,7 @@ P0_AFTER_010 = [
     SQL / "011_p0_price_floor_override.sql",
     SQL / "012_p0_cash_movement_reversals.sql",
     SQL / "013_p0_ai_deal_update_and_reason_catalogs.sql",
+    SQL / "014_manual_contact_phone_numbers.sql",
 ]
 
 
@@ -143,12 +144,14 @@ class P0DatabaseMigrationTests(unittest.TestCase):
         tables = self.pg.query(database, """
             SELECT tablename FROM pg_tables WHERE schemaname='public'
               AND tablename IN ('economics_settings_versions','deal_economics_revisions',
-                'deal_income_recognitions','deal_cash_movements','deal_cost_obligations','ai_action_drafts')
+                'deal_income_recognitions','deal_cash_movements','deal_cost_obligations','ai_action_drafts',
+                'contact_phone_numbers')
             ORDER BY tablename;
         """)
         self.assertEqual(tables, [
-            "ai_action_drafts", "deal_cash_movements", "deal_cost_obligations",
-            "deal_economics_revisions", "deal_income_recognitions", "economics_settings_versions",
+            "ai_action_drafts", "contact_phone_numbers", "deal_cash_movements", "deal_cost_obligations",
+            "deal_economics_revisions", "deal_income_recognitions",
+            "economics_settings_versions",
         ])
 
         draft_columns = self.pg.query(database, """
@@ -157,6 +160,112 @@ class P0DatabaseMigrationTests(unittest.TestCase):
         """)
         self.assertIn("base_deal_snapshot", draft_columns)
         self.assertIn("proposal_schema_version", draft_columns)
+
+    def test_manual_contact_phone_backfill_and_canonical_lookup_are_replay_safe(self):
+        database = "p0_manual_contact_phones"
+        self.apply_core_and_p0(database)
+        self.pg.sql(database, """
+            INSERT INTO contacts(full_name,phone_normalized,phone_raw)
+            VALUES('Manual client','8 (999) 111-22-33','8 (999) 111-22-33');
+        """)
+        for path in [P0_010, *P0_AFTER_010]:
+            self.pg.execute_file(database, path)
+        self.assertEqual(self.pg.query(database, """
+            SELECT phone_key || '|' || phone_normalized || '|' || is_primary::text || '|' || active::text
+              FROM contact_phone_numbers;
+        """), ["79991112233|+79991112233|true|true"])
+        self.assertEqual(self.pg.query(database, """
+            SELECT contact_for_phone('+7 999 111-22-33', '+7 999 111-22-33')::text
+              = (SELECT id::text FROM contacts WHERE full_name='Manual client');
+        """), ["t"])
+        # A manually entered international 00 prefix and a Novofon-normalized
+        # + prefix must map to one canonical CRM identity.
+        self.assertEqual(self.pg.query(database, """
+            SELECT canonical_contact_phone('0049 30 1234567') || '|'
+                   || canonical_contact_phone('+49 30 1234567');
+        """), ["49301234567|49301234567"])
+        self.pg.sql(database, """
+            SELECT ingest_asterisk_call(
+                'manual-phone-call', 'in', '8 (999) 111-22-33', '+73832359277',
+                now(), 10, '/recordings/manual-rx.wav', '/recordings/manual-tx.wav'
+            );
+        """)
+        self.assertEqual(self.pg.query(database, """
+            SELECT (c.contact_id=pn.contact_id)::text || '|' || (c.contact_phone_number_id=pn.id)::text
+              FROM calls c JOIN contact_phone_numbers pn ON pn.phone_key='79991112233'
+             WHERE c.external_call_id='manual-phone-call';
+        """), ["true|true"])
+        # Retain the pre-P0 Asterisk behavior for withheld/extensions/short
+        # remote values: the call is stored, simply without a client identity.
+        self.pg.sql(database, """
+            SELECT ingest_asterisk_call(
+                'manual-short-phone-call', 'in', '12345', '+73832359277',
+                now(), 10, '/recordings/short-rx.wav', '/recordings/short-tx.wav'
+            );
+        """)
+        self.assertEqual(self.pg.query(database, """
+            SELECT (contact_id IS NULL)::text || '|' || (contact_phone_number_id IS NULL)::text
+              FROM calls WHERE external_call_id='manual-short-phone-call';
+        """), ["true|true"])
+        # A migration replay must preserve the one immutable phone identity.
+        for path in [P0_010, *P0_AFTER_010]:
+            self.pg.execute_file(database, path)
+        self.assertEqual(self.pg.query(database, "SELECT count(*) FROM contact_phone_numbers;"), ["1"])
+
+    def test_manual_contact_phone_migration_stops_before_writes_on_canonical_collision(self):
+        database = "p0_manual_phone_collision"
+        self.apply_core_and_p0(database)
+        self.pg.sql(database, """
+            INSERT INTO contacts(full_name,phone_normalized) VALUES
+              ('First duplicate','+79991112234'),
+              ('Second duplicate','8 (999) 111-22-34');
+        """)
+        self.pg.execute_file(database, P0_010)
+        for path in P0_AFTER_010[:-1]:
+            self.pg.execute_file(database, path)
+        with self.assertRaises(AssertionError) as failure:
+            self.pg.execute_file(database, P0_AFTER_010[-1])
+        self.assertIn("canonical-phone collision", str(failure.exception))
+        self.assertEqual(self.pg.query(database, "SELECT to_regclass('public.contact_phone_numbers') IS NULL;"), ["t"])
+
+    def test_manual_phone_schema_rejects_invalid_keys_and_cross_contact_links(self):
+        database = "p0_manual_phone_integrity"
+        self.apply_final_p0(database)
+        invalid = subprocess.run(
+            ["docker", "exec", "-i", self.pg.container, "psql", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database],
+            input=(
+                "INSERT INTO contacts(phone_normalized) VALUES('+79991112240');\n"
+                "INSERT INTO contact_phone_numbers(contact_id,phone_key,phone_normalized) "
+                "SELECT id,'not-a-phone','not-a-phone' FROM contacts LIMIT 1;\n"
+            ),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("contact_phone_numbers_phone_key_matches_normalized", invalid.stderr)
+
+        cross_link = subprocess.run(
+            ["docker", "exec", "-i", self.pg.container, "psql", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database],
+            input="""
+                WITH first_contact AS (
+                    INSERT INTO contacts(phone_normalized) VALUES('+79991112241') RETURNING id
+                ), second_contact AS (
+                    INSERT INTO contacts(phone_normalized) VALUES('+79991112242') RETURNING id
+                ), second_phone AS (
+                    INSERT INTO contact_phone_numbers(contact_id,phone_key,phone_normalized,is_primary)
+                    SELECT id,'79991112242','+79991112242',true FROM second_contact RETURNING id
+                )
+                INSERT INTO calls(call_id,direction,started_at,contact_id,contact_phone_number_id)
+                SELECT 'cross-contact-phone','in',now(),first_contact.id,second_phone.id
+                  FROM first_contact CROSS JOIN second_phone;
+            """,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        self.assertNotEqual(cross_link.returncode, 0)
+        self.assertIn("calls_contact_phone_number_contact_fk", cross_link.stderr)
 
     def test_revisions_and_cash_movements_are_immutable(self):
         database = "p0_immutability"

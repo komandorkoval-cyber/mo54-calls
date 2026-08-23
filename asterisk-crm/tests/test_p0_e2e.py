@@ -12,11 +12,14 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,9 +64,25 @@ def load_worker_database_module(database_url: str):
     previous_psycopg2 = sys.modules.get("psycopg2")
     previous_extras = sys.modules.get("psycopg2.extras")
     previous_novofon = sys.modules.get("novofon")
+
+    class Psycopg2CompatConnection:
+        """Accept psycopg2's cursor_factory kwarg on a psycopg3 test connection."""
+
+        def __init__(self, connection):
+            self._connection = connection
+
+        def cursor(self, *args, cursor_factory=None, **kwargs):
+            if cursor_factory is not None:
+                from psycopg.rows import dict_row
+                kwargs.setdefault("row_factory", dict_row)
+            return self._connection.cursor(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
     fake_psycopg2 = types.ModuleType("psycopg2")
     fake_extras = types.ModuleType("psycopg2.extras")
-    fake_psycopg2.connect = lambda dsn: connect(dsn)
+    fake_psycopg2.connect = lambda dsn: Psycopg2CompatConnection(connect(dsn))
     fake_extras.Json = lambda value: json.dumps(value, ensure_ascii=False)
     fake_extras.RealDictCursor = object
     fake_psycopg2.extras = fake_extras
@@ -588,6 +607,297 @@ class P0EndToEndAcceptanceTests(unittest.TestCase):
         finally:
             owner_client.close()
             other_client.close()
+
+    def test_manager_can_create_client_add_assistant_number_and_call_that_saved_number(self):
+        owner_client, owner_headers = self.client_for(self.owner)
+        other_client, other_headers = self.client_for(self.other)
+        originals = (self.app.NOVOFON_ACCESS_TOKEN, self.app.NOVOFON_VIRTUAL_NUMBER)
+        captured: dict[str, object] = {}
+
+        async def fake_start_employee_call(_client, **kwargs):
+            captured.update(kwargs)
+            return {
+                "result": {"status": "accepted", "data": {"call_session_id": "manual-phone-session"}},
+                "request": {"params": {"access_token": "test-only"}},
+                "response": {"result": {"status": "accepted"}},
+            }
+
+        try:
+            created = owner_client.post("/api/contacts", headers=owner_headers, json={
+                "full_name": "Manual client", "phone": "8 (999) 111-22-35",
+                "email": "manual@example.test", "notes": "Entered by manager",
+            })
+            self.assertEqual(created.status_code, 201, created.text)
+            contact = created.json()
+            self.assertEqual(contact["phone_numbers"][0]["phone_normalized"], "+79991112235")
+            primary_phone_id = contact["phone_numbers"][0]["id"]
+
+            listed = owner_client.get("/api/contacts", headers=owner_headers)
+            self.assertEqual(listed.status_code, 200, listed.text)
+            self.assertIn(contact["id"], {row["id"] for row in listed.json()})
+            self.assertEqual(other_client.get(f"/api/contacts/{contact['id']}", headers=other_headers).status_code, 404)
+            self.db(
+                """INSERT INTO tasks(contact_id,assignee_id,title)
+                   VALUES(%s,%s,'Task-only read access')""",
+                (contact["id"], self.other.id),
+            )
+            task_reader = other_client.get(f"/api/contacts/{contact['id']}", headers=other_headers)
+            self.assertEqual(task_reader.status_code, 200, task_reader.text)
+            self.assertFalse(task_reader.json()["can_write"])
+            self.assertEqual(
+                other_client.patch(
+                    f"/api/contacts/{contact['id']}", headers=other_headers,
+                    json={"notes": "task assignee must not overwrite the customer"},
+                ).status_code,
+                404,
+            )
+            self.assertEqual(
+                other_client.post(
+                    f"/api/contacts/{contact['id']}/phone-numbers", headers=other_headers,
+                    json={"phone": "+79991112237", "label": "Foreign", "role": "other"},
+                ).status_code,
+                404,
+            )
+            self.assertEqual(
+                other_client.post(
+                    "/api/calls/initiate",
+                    headers={**other_headers, "Idempotency-Key": "task-only-callback-denied"},
+                    json={"contact_id": contact["id"], "contact_phone_number_id": primary_phone_id},
+                ).status_code,
+                404,
+            )
+
+            assistant = owner_client.post(f"/api/contacts/{contact['id']}/phone-numbers", headers=owner_headers, json={
+                "phone": "+7 999 111-22-36", "label": "Помощник Елена", "role": "assistant",
+            })
+            self.assertEqual(assistant.status_code, 201, assistant.text)
+            assistant_phone = assistant.json()
+            self.assertEqual(assistant_phone["phone_normalized"], "+79991112236")
+            self.assertFalse(assistant_phone["is_primary"])
+            self.assertEqual(
+                other_client.post(f"/api/contacts/{contact['id']}/phone-numbers", headers=other_headers, json={
+                    "phone": "+79991112237", "label": "Foreign", "role": "other",
+                }).status_code,
+                404,
+            )
+            duplicate = owner_client.post("/api/contacts", headers=owner_headers, json={
+                "full_name": "Duplicate", "phone": "7 999 111 22 36",
+            })
+            self.assertEqual(duplicate.status_code, 409)
+
+            detail = owner_client.get(f"/api/contacts/{contact['id']}", headers=owner_headers)
+            self.assertEqual(detail.status_code, 200, detail.text)
+            self.assertEqual([row["id"] for row in detail.json()["phone_numbers"]], [primary_phone_id, assistant_phone["id"]])
+
+            self.db(
+                """INSERT INTO provider_employee_mappings(
+                       provider,crm_user_id,provider_employee_id,active,provider_payload
+                   ) VALUES('novofon',%s,'10001',true,%s::jsonb)""",
+                (self.owner.id, json.dumps({"mobile_phone": "+79990000001"})),
+            )
+            self.app.NOVOFON_ACCESS_TOKEN = "p0-manual-contact-test-token"
+            self.app.NOVOFON_VIRTUAL_NUMBER = "79990000002"
+            with patch.object(self.app.NovofonClient, "start_employee_call", new=fake_start_employee_call):
+                initiated = owner_client.post("/api/calls/initiate", headers={
+                    **owner_headers, "Idempotency-Key": "manual-assistant-phone-call-0001",
+                }, json={
+                    "contact_id": contact["id"],
+                    "contact_phone_number_id": assistant_phone["id"],
+                })
+            self.assertEqual(initiated.status_code, 200, initiated.text)
+            self.assertEqual(captured["contact_phone"], "79991112236")
+            persisted = self.db(
+                """SELECT contact_id::text,contact_phone_number_id::text,to_number
+                     FROM call_initiation_requests WHERE id=%s""",
+                (initiated.json()["id"],),
+            )
+            self.assertEqual(persisted, {
+                "contact_id": contact["id"],
+                "contact_phone_number_id": assistant_phone["id"],
+                "to_number": "79991112236",
+            })
+            self.assertEqual(self.scalar(
+                "SELECT count(*) FROM audit_log WHERE entity_type='contact' AND entity_id=%s AND action='create'",
+                (contact["id"],),
+            ), 1)
+            self.assertEqual(self.scalar(
+                "SELECT count(*) FROM audit_log WHERE entity_type='contact_phone_number' AND entity_id=%s AND action='create'",
+                (primary_phone_id,),
+            ), 1)
+            self.assertEqual(self.scalar(
+                "SELECT count(*) FROM audit_log WHERE entity_type='contact_phone_number' AND entity_id=%s AND action='create'",
+                (assistant_phone["id"],),
+            ), 1)
+            initiation_audit = self.db(
+                """SELECT action,before_data,after_data FROM audit_log
+                   WHERE entity_type='call_initiation' AND entity_id=%s
+                   ORDER BY created_at""",
+                (initiated.json()["id"],),
+                many=True,
+            )
+            self.assertEqual([row["action"] for row in initiation_audit], ["create", "accepted"])
+            self.assertEqual(initiation_audit[0]["after_data"]["contact_phone_number_id"], assistant_phone["id"])
+            self.assertEqual(initiation_audit[1]["after_data"]["status"], "accepted")
+
+            raw_override = owner_client.post("/api/calls/initiate", headers={
+                **owner_headers, "Idempotency-Key": "manual-unregistered-phone-0002",
+            }, json={"contact_id": contact["id"], "phone": "+79991112237"})
+            self.assertEqual(raw_override.status_code, 422)
+            self.assertEqual(self.scalar(
+                "SELECT contact_for_phone('8 (999) 111-22-36')::text",
+            ), contact["id"])
+            with self.app.pool.connection() as connection, connection.cursor() as cursor:
+                worker_contact_id = self.worker_db._novofon_contact(cursor, "8 (999) 111-22-36")
+                worker_phone_id = self.worker_db._novofon_contact_phone_number(
+                    cursor, worker_contact_id, "8 (999) 111-22-36"
+                )
+                connection.commit()
+            self.assertEqual(worker_contact_id, contact["id"])
+            self.assertEqual(worker_phone_id, assistant_phone["id"])
+            provider_event = self.worker_db.NovofonEvent(
+                event_type="CALL_END", call_session_id="manual-phone-session", external_id=None,
+                occurred_at=datetime.now(timezone.utc), direction="out", direction_known=True,
+                contact_phone="+79991112236", virtual_phone="+79990000002", employee_id="10001",
+                employee_extension=None, employee_name=None, talk_duration_sec=12, total_duration_sec=14,
+                call_status="completed", is_lost=False, answered=True, recording_url=None,
+                recording_id=None, recording_duration_sec=0,
+            )
+            with self.app.pool.connection() as connection, connection.cursor() as cursor:
+                provider_context = self.worker_db._novofon_initiation_context(cursor, provider_event)
+                self.assertEqual(str(provider_context["contact_id"]), contact["id"])
+                self.assertEqual(str(provider_context["contact_phone_number_id"]), assistant_phone["id"])
+                persisted_call_id = self.worker_db._upsert_novofon_call(
+                    cursor, provider_event, {"event": "CALL_END"}, contact["id"], assistant_phone["id"], str(self.owner.id)
+                )
+                connection.commit()
+            provider_call = self.db(
+                "SELECT contact_id::text,contact_phone_number_id::text FROM calls WHERE id=%s",
+                (persisted_call_id,),
+            )
+            self.assertEqual(provider_call, {
+                "contact_id": contact["id"], "contact_phone_number_id": assistant_phone["id"],
+            })
+            reassignment_target = owner_client.post("/api/contacts", headers=owner_headers, json={
+                "full_name": "Reassigned client", "phone": "+79991112237",
+            })
+            self.assertEqual(reassignment_target.status_code, 201, reassignment_target.text)
+            reassigned = owner_client.patch(
+                f"/api/calls/{persisted_call_id}",
+                headers=owner_headers,
+                json={"contact_id": reassignment_target.json()["id"]},
+            )
+            self.assertEqual(reassigned.status_code, 200, reassigned.text)
+            self.assertEqual(reassigned.json()["contact_id"], reassignment_target.json()["id"])
+            self.assertIsNone(reassigned.json()["contact_phone_number_id"])
+            previous_worker_virtual = os.environ.get("NOVOFON_VIRTUAL_NUMBER")
+            os.environ["NOVOFON_VIRTUAL_NUMBER"] = "+79990000002"
+            try:
+                processed = self.worker_db.process_novofon_event({
+                    "id": str(uuid.uuid4()),
+                    "payload": {
+                        "event": "CALL_END",
+                        "call_session_id": "manual-phone-session",
+                        "direction": "out",
+                        "virtual_phone_number": "+79990000002",
+                        "contact_info": {"contact_phone_number": "+79991112236"},
+                        "employee_info": {"employee_id": "10001"},
+                        "call_info": {
+                            "talk_duration": "12",
+                            "total_duration": "14",
+                            "call_status": "completed",
+                        },
+                        "notification_time": "2026-08-22T12:00:00+07:00",
+                    },
+                })
+            finally:
+                if previous_worker_virtual is None:
+                    os.environ.pop("NOVOFON_VIRTUAL_NUMBER", None)
+                else:
+                    os.environ["NOVOFON_VIRTUAL_NUMBER"] = previous_worker_virtual
+            self.assertFalse(processed["ignored"])
+            processed_call = self.db(
+                "SELECT contact_id::text,contact_phone_number_id::text FROM calls WHERE id=%s",
+                (processed["call_id"],),
+            )
+            self.assertEqual(processed_call, {
+                "contact_id": reassignment_target.json()["id"], "contact_phone_number_id": None,
+            })
+
+            made_primary = owner_client.patch(
+                f"/api/contacts/{contact['id']}/phone-numbers/{assistant_phone['id']}",
+                headers=owner_headers,
+                json={"is_primary": True},
+            )
+            self.assertEqual(made_primary.status_code, 200, made_primary.text)
+            self.assertTrue(made_primary.json()["is_primary"])
+            self.assertEqual(self.scalar("SELECT phone_normalized FROM contacts WHERE id=%s", (contact["id"],)), "+79991112236")
+            primary_audit = self.db(
+                """SELECT entity_type,entity_id,action,before_data,after_data
+                   FROM audit_log
+                   WHERE entity_id IN (%s,%s,%s)
+                     AND action IN ('demote_primary','primary_phone_changed')
+                   ORDER BY created_at""",
+                (primary_phone_id, assistant_phone["id"], contact["id"]),
+                many=True,
+            )
+            self.assertEqual(
+                [(row["entity_type"], row["action"]) for row in primary_audit],
+                [("contact_phone_number", "demote_primary"), ("contact", "primary_phone_changed")],
+            )
+            self.assertTrue(primary_audit[0]["before_data"]["is_primary"])
+            self.assertFalse(primary_audit[0]["after_data"]["is_primary"])
+            self.assertEqual(primary_audit[1]["after_data"]["phone_normalized"], "+79991112236")
+            self.assertEqual(
+                owner_client.patch(
+                    f"/api/contacts/{contact['id']}/phone-numbers/{assistant_phone['id']}",
+                    headers=owner_headers,
+                    json={"active": False},
+                ).status_code,
+                422,
+            )
+        finally:
+            self.app.NOVOFON_ACCESS_TOKEN, self.app.NOVOFON_VIRTUAL_NUMBER = originals
+            owner_client.close()
+            other_client.close()
+
+    def test_concurrent_phone_resolution_is_singleton_and_matches_novofon_normalization(self):
+        from psycopg import connect
+
+        barrier = threading.Barrier(2)
+        results: list[str] = []
+        failures: list[BaseException] = []
+
+        def resolve(raw_phone: str) -> None:
+            try:
+                with connect(self.database_url) as connection, connection.cursor() as cursor:
+                    barrier.wait(timeout=5)
+                    cursor.execute("SELECT contact_for_phone(%s,%s)::text", (raw_phone, raw_phone))
+                    results.append(cursor.fetchone()[0])
+            except BaseException as exc:  # Assertion below reports either worker failure.
+                failures.append(exc)
+
+        first = threading.Thread(target=resolve, args=("0049 30 1234567",))
+        second = threading.Thread(target=resolve, args=("+49 30 1234567",))
+        first.start()
+        second.start()
+        first.join(timeout=10)
+        second.join(timeout=10)
+
+        self.assertFalse(first.is_alive() or second.is_alive(), "canonical phone resolver deadlocked")
+        self.assertEqual(failures, [])
+        self.assertEqual(len(set(results)), 1)
+        self.assertEqual(
+            self.scalar(
+                "SELECT count(*) FROM contacts WHERE canonical_contact_phone(phone_normalized)='49301234567'"
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.scalar("SELECT count(*) FROM contact_phone_numbers WHERE phone_key='49301234567'"),
+            1,
+        )
+        self.assertEqual(self.worker_db.normalize_phone("0049 30 1234567"), "+49301234567")
+        self.assertIsNone(self.worker_db.normalize_phone("0049" + "1" * 20))
 
 
 class P0MobileAndClientContractTests(unittest.TestCase):
