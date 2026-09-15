@@ -24,7 +24,7 @@ from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from pwdlib import PasswordHash
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from novofon import (
     CALL_API_URL,
@@ -61,6 +61,13 @@ RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "/recordings")).resolve()
 ADMIN_EMAIL = os.environ.get("CRM_ADMIN_EMAIL", "admin@mo54.local").lower()
 ADMIN_PASSWORD = os.environ.get("CRM_ADMIN_PASSWORD", "")
 INGEST_TOKEN = os.environ.get("INGEST_TOKEN", "")
+# This is an API-only credential for the home Windows agent.  Rotating or
+# clearing it in .api.secrets.env revokes the agent when the API container is
+# recreated with the updated environment.
+# It is intentionally separate from browser sessions and Novofon credentials.
+LOCAL_AGENT_TOKEN = os.environ.get("LOCAL_AGENT_TOKEN", "")
+if LOCAL_AGENT_TOKEN and len(LOCAL_AGENT_TOKEN) < 32:
+    raise RuntimeError("LOCAL_AGENT_TOKEN must be at least 32 characters")
 
 # Public production values belong in .env on the VPS.  The defaults deliberately
 # keep a developer's loopback stack usable without weakening public deployment.
@@ -453,6 +460,47 @@ class IngestCall(BaseModel):
     duration_sec: int = Field(gt=0)
     recording_customer: str
     recording_manager: str
+
+
+class LocalAgentTranscriptSegment(BaseModel):
+    """One local-ASR segment; no provider URL, audio, or browser data is accepted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ordinal: int = Field(ge=0, le=100_000)
+    started_ms: int = Field(ge=0)
+    ended_ms: int = Field(gt=0)
+    role: Literal["customer", "manager", "unknown"]
+    speaker_label: str | None = Field(None, min_length=1, max_length=100)
+    text: str = Field(min_length=1, max_length=20_000)
+
+    @model_validator(mode="after")
+    def valid_interval(self) -> "LocalAgentTranscriptSegment":
+        if self.ended_ms <= self.started_ms:
+            raise ValueError("ended_ms must be greater than started_ms")
+        return self
+
+
+class LocalAgentTranscript(BaseModel):
+    """Strict text-only contract for the home Windows transcription agent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    call_session_id: str = Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")
+    audio_sha256: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
+    audio_duration_sec: int = Field(gt=0, le=86_400)
+    asr_model: str = Field(min_length=1, max_length=200)
+    language: str = Field(min_length=2, max_length=32)
+    text: str = Field(min_length=1, max_length=500_000)
+    segments: list[LocalAgentTranscriptSegment] = Field(min_length=1, max_length=100_000)
+
+    @model_validator(mode="after")
+    def ordered_segments(self) -> "LocalAgentTranscript":
+        expected = list(range(len(self.segments)))
+        actual = [segment.ordinal for segment in self.segments]
+        if actual != expected:
+            raise ValueError("segments must have contiguous ordinals starting at zero")
+        return self
 
 
 class DealCreate(BaseModel):
@@ -1216,6 +1264,124 @@ def ingest_call(body: IngestCall, x_ingest_token: str | None = Header(None)):
     return {"call_id": row["id"], "idempotency_key": f"{body.source}:{body.external_call_id}"}
 
 
+@app.post("/api/integrations/local-agent/transcripts")
+def ingest_local_agent_transcript(
+    body: LocalAgentTranscript,
+    x_local_agent_token: str | None = Header(None),
+):
+    """Persist an idempotent local transcript and queue only text analysis.
+
+    Audio files, Novofon URLs, cookies, and passwords are rejected by the
+    schema.  A stable Novofon session ID is the sole call lookup, so a local
+    agent cannot attach a transcript to a guessed call by phone or timestamp.
+    """
+    if not LOCAL_AGENT_TOKEN:
+        raise HTTPException(503, "Интеграция локального агента не включена")
+    if not x_local_agent_token or not hmac.compare_digest(x_local_agent_token, LOCAL_AGENT_TOKEN):
+        raise HTTPException(401, "Недействительный токен локального агента")
+
+    call = fetch_one(
+        "SELECT id FROM calls WHERE source='novofon' AND external_call_id=%s",
+        (body.call_session_id,),
+    )
+    if not call:
+        raise HTTPException(404, "Звонок Novofon не найден")
+
+    audio_sha256 = body.audio_sha256.lower()
+    existing = fetch_one(
+        """SELECT id, version FROM transcripts
+           WHERE call_id=%s AND source_kind='local_browser_agent' AND source_audio_sha256=%s
+           ORDER BY version DESC LIMIT 1""",
+        (call["id"], audio_sha256),
+    )
+    if existing:
+        return {
+            "call_id": call["id"],
+            "transcript_id": str(existing["id"]),
+            "version": existing["version"],
+            "idempotent": True,
+        }
+
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT coalesce(max(version),0)+1 AS version FROM transcripts WHERE call_id=%s", (call["id"],))
+            version = cur.fetchone()["version"]
+            cur.execute(
+                """INSERT INTO transcripts(call_id,version,text,asr_model,language,source_kind,source_audio_sha256)
+                   VALUES(%s,%s,%s,%s,%s,'local_browser_agent',%s) RETURNING id""",
+                (call["id"], version, body.text, body.asr_model, body.language, audio_sha256),
+            )
+            transcript_id = cur.fetchone()["id"]
+            cur.executemany(
+                """INSERT INTO transcript_segments(transcript_id,speaker,started_ms,ended_ms,text,ordinal,speaker_label)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+                [
+                    (
+                        transcript_id,
+                        segment.role,
+                        segment.started_ms,
+                        segment.ended_ms,
+                        segment.text,
+                        segment.ordinal,
+                        segment.speaker_label,
+                    )
+                    for segment in body.segments
+                ],
+            )
+            cur.execute(
+                """UPDATE calls SET transcript=%s, processing_status='analyzing', status='transcribed',
+                           processing_error=NULL, updated_at=now() WHERE id=%s""",
+                (body.text, call["id"]),
+            )
+            # The existing worker sends the text to the configured LLM and only
+            # creates reviewable AI drafts.  It never mutates a deal/contact/task here.
+            cur.execute(
+                """INSERT INTO processing_jobs(call_id,kind,status,next_attempt_at,attempts,last_error)
+                   VALUES(%s,'analyze','pending',now(),0,NULL)
+                   ON CONFLICT(call_id,kind) DO UPDATE SET status='pending',next_attempt_at=now(),
+                     attempts=0,last_error=NULL,locked_at=NULL,locked_by=NULL,updated_at=now()""",
+                (call["id"],),
+            )
+            # Deliberately record technical delivery metadata only, never the
+            # transcript text, speaker names, browser data, or audio location.
+            cur.execute(
+                """INSERT INTO audit_log(actor_id,entity_type,entity_id,action,before_data,after_data)
+                   VALUES(NULL,'call',%s,'local_agent_transcript',NULL,%s::jsonb)""",
+                (
+                    str(call["id"]),
+                    json.dumps(
+                        {
+                            "source": "local_browser_agent",
+                            "version": version,
+                            "asr_model": body.asr_model,
+                            "audio_duration_sec": body.audio_duration_sec,
+                            "segment_count": len(body.segments),
+                            "audio_sha256": audio_sha256,
+                        }
+                    ),
+                ),
+            )
+            conn.commit()
+    except UniqueViolation:
+        # A retry can race an in-flight delivery.  The unique audio identity
+        # makes it the same successful result instead of a second version.
+        existing = fetch_one(
+            """SELECT id, version FROM transcripts
+               WHERE call_id=%s AND source_kind='local_browser_agent' AND source_audio_sha256=%s
+               ORDER BY version DESC LIMIT 1""",
+            (call["id"], audio_sha256),
+        )
+        if existing:
+            return {
+                "call_id": call["id"],
+                "transcript_id": str(existing["id"]),
+                "version": existing["version"],
+                "idempotent": True,
+            }
+        raise
+    return {"call_id": call["id"], "transcript_id": str(transcript_id), "version": version, "idempotent": False}
+
+
 DEFAULT_NOVOFON_ACCOUNT_TIMEZONE = "Europe/Moscow"
 
 
@@ -1410,10 +1576,11 @@ def get_call(call_id: int, user: User = Depends(current_user)):
            FROM ai_action_drafts WHERE call_id=%s ORDER BY created_at DESC""",
         (call_id,),
     )
+    novofon_waiting_for_local_transcript = call["source"] == "novofon" and not call["transcript"]
     call["automation"] = {
-        "transcript": "unavailable" if call["source"] == "novofon" and not call["transcript"] else "ready" if call["transcript"] else "waiting",
-        "analysis": "unavailable" if call["source"] == "novofon" and not call["transcript"] else "ready" if call["insight"] else "waiting",
-        "reason": "В пилоте Novofon расшифровка и ИИ-анализ не подключены." if call["source"] == "novofon" and not call["transcript"] else None,
+        "transcript": "waiting" if novofon_waiting_for_local_transcript else "ready" if call["transcript"] else "waiting",
+        "analysis": "waiting" if novofon_waiting_for_local_transcript else "ready" if call["insight"] else "waiting",
+        "reason": "Ожидается локальная расшифровка; аудио остаётся на домашнем ПК." if novofon_waiting_for_local_transcript else None,
     }
     return call
 

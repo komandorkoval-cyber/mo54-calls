@@ -1,0 +1,17 @@
+{
+  "crm_url": "https://calls.example.invalid",
+  "novofon_calls_url": "",
+  "timezone": "Asia/Novosibirsk",
+  "daily_download_limit": 50,
+  "retention_days": 21,
+  "minimum_free_gib": 10,
+  "minimum_free_percent": 15,
+  "manager_match_threshold": 0.72,
+  "selectors": {
+    "call_rows": "[data-call-session-id]",
+    "session_id_attribute": "data-call-session-id",
+    "started_at_attribute": "data-call-started-at",
+    "duration_attribute": "data-call-duration-sec",
+    "download_button": "[data-action='download-recording']"
+  }
+}

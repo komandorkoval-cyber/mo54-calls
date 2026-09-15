@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mo54-novofon-local-agent"
+version = "0.1.0"
+description = "Local-only Novofon recording downloader and transcription agent"
+requires-python = ">=3.12"
+dependencies = [
+  "playwright>=1.52,<2",
+  "httpx>=0.28,<1",
+  "keyring>=25,<26",
+  "tzdata>=2025.2",
+  "gigaam @ https://github.com/salute-developers/GigaAM/archive/559d88d6b72541412743929f633a6ae7c9950b85.zip",
+  "pyannote.audio>=4,<5",
+  "huggingface-hub>=0.30,<1",
+  "numpy>=1.26,<3",
+  "librosa>=0.10,<1",
+  "soundfile>=0.12,<1",
+]
+
+[project.scripts]
+mo54-agent = "mo54_agent.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
