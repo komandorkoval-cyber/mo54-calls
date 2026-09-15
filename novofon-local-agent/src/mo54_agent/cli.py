@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -56,8 +57,12 @@ def main(argv: list[str] | None = None) -> None:
     subcommands.add_parser("run-once")
     # Intentionally local-only: useful for accepting a pilot recording before
     # CRM credentials and the server deployment are in place.
-    subcommands.add_parser("transcribe-pilot")
-    subcommands.add_parser("deliver-pilot")
+    download_pilot = subcommands.add_parser("download-pilot")
+    download_pilot.add_argument("call_session_id")
+    transcribe_pilot = subcommands.add_parser("transcribe-pilot")
+    transcribe_pilot.add_argument("call_session_id")
+    deliver_pilot = subcommands.add_parser("deliver-pilot")
+    deliver_pilot.add_argument("call_session_id")
     subcommands.add_parser("exclude-pending-downloads")
     subcommands.add_parser("status")
     subcommands.add_parser("install-task")
@@ -96,31 +101,50 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "run-once":
             with AgentLock(paths.lock):
                 print(json.dumps(AgentRunner(paths, config, store).run_once(), ensure_ascii=False))
+        elif args.command == "download-pilot":
+            with AgentLock(paths.lock):
+                audio = AgentRunner(paths, config, store).download_pilot(args.call_session_id)
+                # This local-only receipt provides the acceptance metadata
+                # without printing an audio path, browser data, or transcript.
+                print(json.dumps({
+                    "downloaded": 1,
+                    "call_session_id": args.call_session_id,
+                    "audio_sha256": audio.sha256,
+                    "audio_duration_sec": audio.duration_sec,
+                }, ensure_ascii=False))
         elif args.command == "transcribe-pilot":
             with AgentLock(paths.lock):
-                records = store.pending({"downloaded", "asr_retry"})
-                if len(records) != 1:
-                    raise AgentError("pilot_record_ambiguous", "Exactly one downloaded pilot recording is required", retryable=False)
-                record = records[0]
+                record = store.get(args.call_session_id)
+                if not record or record.status not in {"downloaded", "asr_retry"}:
+                    raise AgentError("pilot_call_not_transcribable", "The selected pilot call is not ready for local ASR", retryable=False)
                 if not record.audio_path or not record.audio_path.is_file():
                     raise AgentError("pilot_audio_missing", "The downloaded pilot audio is unavailable", retryable=False)
                 if not store.claim_transcription(record.call_session_id):
                     raise AgentError("state_conflict", "The pilot recording is already being processed", retryable=True)
                 runner = AgentRunner(paths, config, store)
+                started = time.monotonic()
                 try:
                     transcript = runner._transcribe(record.call_session_id, record.audio_path)
                     transcript_path = runner._save_transcript(record.call_session_id, transcript)
                     store.mark_transcribed(record.call_session_id, transcript_path, transcript.asr_model, transcript.language)
-                    print(json.dumps({"transcribed": 1, "segments": len(transcript.segments), "language": transcript.language}, ensure_ascii=False))
+                    roles = {role: sum(segment.role == role for segment in transcript.segments) for role in ("manager", "customer", "unknown")}
+                    print(json.dumps({
+                        "transcribed": 1,
+                        "call_session_id": args.call_session_id,
+                        "segments": len(transcript.segments),
+                        "roles": roles,
+                        "language": transcript.language,
+                        "processing_seconds": round(time.monotonic() - started, 2),
+                        "review_required_before_delivery": True,
+                    }, ensure_ascii=False))
                 except AgentError as exc:
                     store.mark_error(record.call_session_id, exc.code, asr=True)
                     raise
         elif args.command == "deliver-pilot":
             with AgentLock(paths.lock):
-                records = store.pending({"transcribed"})
-                if len(records) != 1:
-                    raise AgentError("pilot_record_ambiguous", "Exactly one transcribed pilot recording is required", retryable=False)
-                record = records[0]
+                record = store.get(args.call_session_id)
+                if not record or record.status != "transcribed":
+                    raise AgentError("pilot_call_not_deliverable", "The selected pilot call is not ready for CRM delivery", retryable=False)
                 if not record.audio_sha256 or not record.audio_duration_sec or not record.transcript_path:
                     raise AgentError("pilot_transcript_missing", "The pilot transcript metadata is incomplete", retryable=False)
                 transcript = Transcript.from_path(record.transcript_path)

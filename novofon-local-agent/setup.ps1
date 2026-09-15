@@ -12,15 +12,33 @@ $ErrorActionPreference = 'Stop'
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $agentRoot = Join-Path $env:LOCALAPPDATA 'MO54CallsAgent'
 $venv = Join-Path $agentRoot 'venv'
-$python = 'py.exe'
+$pythonCandidates = @(
+    (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'),
+    (Join-Path $env:ProgramFiles 'Python312\python.exe')
+)
 
-if (-not (Get-Command $python -ErrorAction SilentlyContinue)) {
-    throw 'Python Launcher (py.exe) with Python 3.12 is required.'
+$python = $pythonCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (-not $python) {
+    $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($launcher) {
+        $launcherProbe = & $launcher.Source -3.12 -c "import sys; print(sys.version_info[:2])" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $launcherProbe -match '^\(3, 12\)') {
+            $python = $launcher.Source
+        }
+    }
+}
+
+if (-not $python) {
+    throw 'Python 3.12 is required. Install it for the current user, then run this setup again.'
 }
 
 New-Item -ItemType Directory -Force -Path $agentRoot, (Join-Path $agentRoot 'audio'), (Join-Path $agentRoot 'models') | Out-Null
 if (-not (Test-Path (Join-Path $venv 'Scripts\python.exe'))) {
-    & $python -3.12 -m venv $venv
+    if ((Split-Path -Leaf $python) -ieq 'py.exe') {
+        & $python -3.12 -m venv $venv
+    } else {
+        & $python -m venv $venv
+    }
 }
 
 $venvPython = Join-Path $venv 'Scripts\python.exe'

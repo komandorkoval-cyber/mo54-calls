@@ -57,8 +57,18 @@ API-контейнер с обновлённым окружением. Сам а
 
 ## Команды
 
-`preflight`, `provision-browser`, `inventory`, `enroll-manager PATH`, `run-once`, `status`,
-`install-task`, `set-crm-token`.
+`preflight`, `provision-browser`, `inspect-layout`, `inventory`, `enroll-manager PATH`,
+`download-pilot CALL_SESSION_ID`, `transcribe-pilot CALL_SESSION_ID`,
+`deliver-pilot CALL_SESSION_ID`, `run-once`, `status`, `install-task`,
+`set-crm-token`.
+
+Для приёмки одного звонка сначала вручную войдите в выделенный профиль Edge,
+запустите `inspect-layout` и `inventory`, а затем выберите один свежий
+`CALL_SESSION_ID` из локальной инвентаризации. `download-pilot` скачивает
+только этот идентификатор и останавливается: он не запускает ASR, CRM или
+обработку остальных звонков. `transcribe-pilot` выводит только контрольные
+метаданные (хэш, длительность, роли и время); качество текста и роли нужно
+подтвердить локально до явного `deliver-pilot`.
 
 `run-once` удерживает Windows от сна только пока идёт скачивание или ASR. При
 заблокированном экране и любой проблеме UI он фиксирует безопасный код ошибки

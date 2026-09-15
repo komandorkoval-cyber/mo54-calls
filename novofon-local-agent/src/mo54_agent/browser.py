@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from .config import AgentConfig, AgentPaths
 from .errors import BrowserInteractionError, StableIdentifierMissing
+from .media import find_media_tool
 
 
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
@@ -70,8 +71,11 @@ def sha256_file(path: Path) -> str:
 
 def media_duration(path: Path) -> int:
     try:
+        ffprobe = find_media_tool("ffprobe")
+        if not ffprobe:
+            raise OSError("ffprobe is unavailable")
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
             capture_output=True,
             text=True,
             check=True,

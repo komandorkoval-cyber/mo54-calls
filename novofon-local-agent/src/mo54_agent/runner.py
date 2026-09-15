@@ -73,6 +73,33 @@ class AgentRunner:
         with prevent_sleep():
             return asr.transcribe(audio_path)
 
+    def download_pilot(self, call_session_id: str) -> DownloadedAudio:
+        """Download one inventoried recent call and stop before ASR or CRM.
+
+        This explicit path avoids `run-once` during acceptance: it cannot
+        discover, transcribe, or deliver any other call as a side effect.
+        """
+        record = self.store.get(call_session_id)
+        if not record:
+            raise AgentError("pilot_call_not_in_inventory", "Run local inventory before selecting a pilot call", retryable=False)
+        if record.started_at < datetime.now(timezone.utc) - timedelta(days=7):
+            raise AgentError("pilot_call_outside_window", "The selected pilot call is outside the seven-day window", retryable=False)
+        if record.status not in {"discovered", "retry"}:
+            raise AgentError("pilot_call_not_downloadable", "The selected pilot call is not ready for one-time download", retryable=False)
+        if not self._disk_ok():
+            raise AgentError("disk_space_critical", "Local disk space is below the configured safety threshold", retryable=False)
+        if not self.store.claim_download(call_session_id, self.config.daily_download_limit, datetime.now(timezone.utc).date()):
+            raise AgentError("pilot_download_limit_or_state", "The daily limit or call state blocks this pilot download", retryable=False)
+        try:
+            audio = self._download_audio(call_session_id)
+            self.store.mark_downloaded(call_session_id, audio.path, audio.sha256, audio.duration_sec)
+            return audio
+        except AgentError as exc:
+            self.store.mark_error(call_session_id, exc.code)
+            self.store.event(exc.code)
+            self.log.warning("pilot_download_failed code=%s", exc.code)
+            raise
+
     def run_once(self) -> dict[str, int]:
         now = datetime.now(timezone.utc)
         since = now - timedelta(days=7)

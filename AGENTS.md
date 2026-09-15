@@ -19,9 +19,16 @@ MO54.  If ownership is ambiguous, do not touch it.  If a requested MO54 Calls
 feature requires access to or integration with MO54, stop that part and report
 the conflict instead of making the change.
 
-## Current P0 scope
+## Current authorized scope
 
-P0 changes are permitted only in the isolated `p0-season-terrace` worktree and
-only for MO54 Calls code, database migrations, tests, and interface.  This
-boundary takes priority over implementation convenience or architectural
-assumptions.
+The user has explicitly authorized the local-transcription pilot in the
+isolated `phase/transcription-ai` worktree.  The `p0-season-terrace` worktree
+is a clean production baseline and must remain unchanged; `repo-main` is the
+Git worktree only.  Do not merge, delete, or reorganize any worktree or
+archive.
+
+If a release is explicitly performed, it is limited to the MO54 Calls
+deployment at `/opt/asterisk-crm` and its `asterisk-crm` Compose project.  Do
+not use global Docker cleanup/down commands or inspect or operate any other
+server project.  This boundary takes priority over implementation convenience
+or architectural assumptions.

@@ -45,6 +45,7 @@ audit_dump.txt
 # Generated and vendor-heavy local tools
 **/__pycache__/
 **/*.pyc
+**/*.egg-info/
 tools/xiaomi-unlock/
 magisk/**/*.apk
 novofon-*.pcap*

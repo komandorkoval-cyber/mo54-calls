@@ -12,6 +12,7 @@ from typing import Any
 from .browser import media_duration
 from .config import AgentConfig, AgentPaths
 from .errors import AgentError
+from .media import find_media_tool
 from .security import load_manager_embedding, save_manager_embedding
 
 
@@ -88,7 +89,7 @@ class LocalASR:
 
     def verify_ready(self) -> list[str]:
         problems: list[str] = []
-        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        if find_media_tool("ffmpeg") is None or find_media_tool("ffprobe") is None:
             problems.append("ffmpeg_missing")
         if not self.diarization_model_path.is_dir():
             problems.append("pyannote_model_missing")
@@ -200,7 +201,10 @@ class LocalASR:
         return self._embedding
 
     def _normalize(self, source: Path, target: Path, *, start: int | None = None, duration: int | None = None) -> None:
-        command = ["ffmpeg", "-nostdin", "-y"]
+        ffmpeg = find_media_tool("ffmpeg")
+        if not ffmpeg:
+            raise AgentError("ffmpeg_missing", "ffmpeg is required for local audio normalization", retryable=False)
+        command = [ffmpeg, "-nostdin", "-y"]
         if start is not None:
             command += ["-ss", str(start)]
         command += ["-i", str(source)]

@@ -31,6 +31,7 @@ P0_AFTER_010 = [
     SQL / "013_p0_ai_deal_update_and_reason_catalogs.sql",
     SQL / "014_manual_contact_phone_numbers.sql",
 ]
+LOCAL_AGENT = SQL / "015_local_agent_transcripts.sql"
 
 
 class PostgresHarness:
@@ -160,6 +161,33 @@ class P0DatabaseMigrationTests(unittest.TestCase):
         """)
         self.assertIn("base_deal_snapshot", draft_columns)
         self.assertIn("proposal_schema_version", draft_columns)
+
+    def test_local_agent_transcript_migration_replays_after_full_p0_schema(self):
+        database = "local_agent_transcript_replay"
+        self.apply_final_p0(database)
+        self.pg.execute_file(database, LOCAL_AGENT)
+        self.pg.execute_file(database, LOCAL_AGENT)
+
+        transcript_columns = self.pg.query(database, """
+            SELECT attname FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid
+             WHERE c.relname='transcripts' AND a.attnum > 0 AND NOT a.attisdropped
+             ORDER BY attname;
+        """)
+        self.assertIn("source_kind", transcript_columns)
+        self.assertIn("source_audio_sha256", transcript_columns)
+
+        segment_columns = self.pg.query(database, """
+            SELECT attname FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid
+             WHERE c.relname='transcript_segments' AND a.attnum > 0 AND NOT a.attisdropped
+             ORDER BY attname;
+        """)
+        self.assertIn("speaker_label", segment_columns)
+
+        indexes = self.pg.query(database, """
+            SELECT indexname FROM pg_indexes
+             WHERE tablename='transcripts' AND indexname='transcripts_local_agent_audio_uidx';
+        """)
+        self.assertEqual(indexes, ["transcripts_local_agent_audio_uidx"])
 
     def test_manual_contact_phone_backfill_and_canonical_lookup_are_replay_safe(self):
         database = "p0_manual_contact_phones"

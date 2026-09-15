@@ -68,6 +68,10 @@ INGEST_TOKEN = os.environ.get("INGEST_TOKEN", "")
 LOCAL_AGENT_TOKEN = os.environ.get("LOCAL_AGENT_TOKEN", "")
 if LOCAL_AGENT_TOKEN and len(LOCAL_AGENT_TOKEN) < 32:
     raise RuntimeError("LOCAL_AGENT_TOKEN must be at least 32 characters")
+# The local agent may always deliver a confirmed transcript.  Sending that
+# text to an LLM is a separate, explicit decision which is disabled by
+# default while the legal/operational basis is being confirmed.
+LOCAL_AGENT_ANALYSIS_ENABLED = os.environ.get("LOCAL_AGENT_ANALYSIS_ENABLED", "").strip().lower() in {"1", "true", "yes"}
 
 # Public production values belong in .env on the VPS.  The defaults deliberately
 # keep a developer's loopback stack usable without weakening public deployment.
@@ -500,6 +504,11 @@ class LocalAgentTranscript(BaseModel):
         actual = [segment.ordinal for segment in self.segments]
         if actual != expected:
             raise ValueError("segments must have contiguous ordinals starting at zero")
+        # Local ffprobe metadata is rounded to whole seconds.  Permit one
+        # second of rounding slack while still rejecting a transcript attached
+        # to materially different audio.
+        if any(segment.ended_ms > (self.audio_duration_sec + 1) * 1000 for segment in self.segments):
+            raise ValueError("segment interval must not exceed audio_duration_sec")
         return self
 
 
@@ -1269,11 +1278,13 @@ def ingest_local_agent_transcript(
     body: LocalAgentTranscript,
     x_local_agent_token: str | None = Header(None),
 ):
-    """Persist an idempotent local transcript and queue only text analysis.
+    """Persist an idempotent local transcript.
 
     Audio files, Novofon URLs, cookies, and passwords are rejected by the
     schema.  A stable Novofon session ID is the sole call lookup, so a local
     agent cannot attach a transcript to a guessed call by phone or timestamp.
+    Text analysis is queued only when explicitly enabled in the Calls API
+    environment; it is off by default.
     """
     if not LOCAL_AGENT_TOKEN:
         raise HTTPException(503, "Интеграция локального агента не включена")
@@ -1304,6 +1315,10 @@ def ingest_local_agent_transcript(
 
     try:
         with pool.connection() as conn, conn.cursor() as cur:
+            # Serialize versions for this one call.  Same-audio retries still
+            # resolve through the unique hash constraint below, while two
+            # genuinely different recordings receive consecutive versions.
+            cur.execute("SELECT id FROM calls WHERE id=%s FOR UPDATE", (call["id"],))
             cur.execute("SELECT coalesce(max(version),0)+1 AS version FROM transcripts WHERE call_id=%s", (call["id"],))
             version = cur.fetchone()["version"]
             cur.execute(
@@ -1329,19 +1344,20 @@ def ingest_local_agent_transcript(
                 ],
             )
             cur.execute(
-                """UPDATE calls SET transcript=%s, processing_status='analyzing', status='transcribed',
+                """UPDATE calls SET transcript=%s, processing_status=%s, status='transcribed',
                            processing_error=NULL, updated_at=now() WHERE id=%s""",
-                (body.text, call["id"]),
+                (body.text, "analyzing" if LOCAL_AGENT_ANALYSIS_ENABLED else "ready", call["id"]),
             )
-            # The existing worker sends the text to the configured LLM and only
-            # creates reviewable AI drafts.  It never mutates a deal/contact/task here.
-            cur.execute(
-                """INSERT INTO processing_jobs(call_id,kind,status,next_attempt_at,attempts,last_error)
-                   VALUES(%s,'analyze','pending',now(),0,NULL)
-                   ON CONFLICT(call_id,kind) DO UPDATE SET status='pending',next_attempt_at=now(),
-                     attempts=0,last_error=NULL,locked_at=NULL,locked_by=NULL,updated_at=now()""",
-                (call["id"],),
-            )
+            if LOCAL_AGENT_ANALYSIS_ENABLED:
+                # The worker receives confirmed text only and creates
+                # reviewable drafts; it never mutates a deal/contact/task here.
+                cur.execute(
+                    """INSERT INTO processing_jobs(call_id,kind,status,next_attempt_at,attempts,last_error)
+                       VALUES(%s,'analyze','pending',now(),0,NULL)
+                       ON CONFLICT(call_id,kind) DO UPDATE SET status='pending',next_attempt_at=now(),
+                         attempts=0,last_error=NULL,locked_at=NULL,locked_by=NULL,updated_at=now()""",
+                    (call["id"],),
+                )
             # Deliberately record technical delivery metadata only, never the
             # transcript text, speaker names, browser data, or audio location.
             cur.execute(
@@ -1357,6 +1373,7 @@ def ingest_local_agent_transcript(
                             "audio_duration_sec": body.audio_duration_sec,
                             "segment_count": len(body.segments),
                             "audio_sha256": audio_sha256,
+                            "analysis_queued": LOCAL_AGENT_ANALYSIS_ENABLED,
                         }
                     ),
                 ),
@@ -1577,10 +1594,22 @@ def get_call(call_id: int, user: User = Depends(current_user)):
         (call_id,),
     )
     novofon_waiting_for_local_transcript = call["source"] == "novofon" and not call["transcript"]
+    novofon_transcript_only = (
+        call["source"] == "novofon"
+        and bool(call["transcript"])
+        and not call["insight"]
+        and not LOCAL_AGENT_ANALYSIS_ENABLED
+    )
     call["automation"] = {
         "transcript": "waiting" if novofon_waiting_for_local_transcript else "ready" if call["transcript"] else "waiting",
-        "analysis": "waiting" if novofon_waiting_for_local_transcript else "ready" if call["insight"] else "waiting",
-        "reason": "Ожидается локальная расшифровка; аудио остаётся на домашнем ПК." if novofon_waiting_for_local_transcript else None,
+        "analysis": "disabled" if novofon_transcript_only else "waiting" if novofon_waiting_for_local_transcript else "ready" if call["insight"] else "waiting",
+        "reason": (
+            "Ожидается локальная расшифровка; аудио остаётся на домашнем ПК."
+            if novofon_waiting_for_local_transcript
+            else "Транскрипт сохранён. ИИ-анализ выключен до отдельного разрешения."
+            if novofon_transcript_only
+            else None
+        ),
     }
     return call
 
@@ -1635,7 +1664,18 @@ def retry_call(call_id: int, stage: Literal["transcribe", "analyze"] = "transcri
         raise HTTPException(404, "Звонок не найден")
     require_call_access(call, user)
     if call["source"] == "novofon":
-        raise HTTPException(409, "В пилоте Novofon автоматическая расшифровка и ИИ-анализ не подключены")
+        if stage != "analyze":
+            raise HTTPException(409, "Расшифровка Novofon выполняется только локальным агентом")
+        if not LOCAL_AGENT_ANALYSIS_ENABLED:
+            raise HTTPException(409, "ИИ-анализ локальных транскриптов не включён")
+        transcript = fetch_one(
+            """SELECT id FROM transcripts
+               WHERE call_id=%s AND source_kind='local_browser_agent'
+               ORDER BY version DESC LIMIT 1""",
+            (call_id,),
+        )
+        if not transcript:
+            raise HTTPException(409, "Сначала нужен подтверждённый локальный транскрипт")
     execute(
         """INSERT INTO processing_jobs(call_id,kind,status,next_attempt_at,attempts,last_error)
            VALUES(%s,%s,'pending',now(),0,NULL)
