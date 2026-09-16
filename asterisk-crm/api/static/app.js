@@ -552,9 +552,14 @@ function previewValue(value) {
 
 function evidenceMarkup(items) {
   return asArray(items).map(item => {
-    const start = item.segment_start_ms == null ? '?' : item.segment_start_ms;
-    const end = item.segment_end_ms == null ? '?' : item.segment_end_ms;
-    return `<small class="draft-evidence">${start}–${end} мс · «${esc(item.quote || '')}»</small>`;
+    const noTimecode = item.segment_start_ms == null && item.segment_end_ms == null;
+    const hasInterval = Number.isInteger(item.segment_start_ms) && Number.isInteger(item.segment_end_ms);
+    const timecode = noTimecode
+      ? 'Время не размечено'
+      : hasInterval
+        ? `${item.segment_start_ms}–${item.segment_end_ms} мс`
+        : 'Некорректный таймкод';
+    return `<small class="draft-evidence">${timecode} · «${esc(item.quote || '')}»</small>`;
   }).join('') || '<small class="muted">Нет подтверждения</small>';
 }
 

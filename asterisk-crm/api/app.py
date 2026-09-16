@@ -472,14 +472,21 @@ class LocalAgentTranscriptSegment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ordinal: int = Field(ge=0, le=100_000)
-    started_ms: int = Field(ge=0)
-    ended_ms: int = Field(gt=0)
+    # A text-only manual review may deliberately omit the audio offsets.  The
+    # pair is still required so an omitted value cannot silently become a
+    # partial or guessed interval.
+    started_ms: int | None = Field(ge=0)
+    ended_ms: int | None = Field(gt=0)
     role: Literal["customer", "manager", "unknown"]
     speaker_label: str | None = Field(None, min_length=1, max_length=100)
     text: str = Field(min_length=1, max_length=20_000)
 
     @model_validator(mode="after")
     def valid_interval(self) -> "LocalAgentTranscriptSegment":
+        if self.started_ms is None or self.ended_ms is None:
+            if self.started_ms is not None or self.ended_ms is not None:
+                raise ValueError("started_ms and ended_ms must both be null or both be integers")
+            return self
         if self.ended_ms <= self.started_ms:
             raise ValueError("ended_ms must be greater than started_ms")
         return self
@@ -504,15 +511,29 @@ class LocalAgentTranscript(BaseModel):
         actual = [segment.ordinal for segment in self.segments]
         if actual != expected:
             raise ValueError("segments must have contiguous ordinals starting at zero")
-        previous_end = 0
+        # A reviewed transcript is either a fully timed timeline or a fully
+        # text-only review.  A mixed stream would make the missing boundaries
+        # ambiguous, so it is not a valid delivery format.
+        has_timecodes = self.segments[0].started_ms is not None
+        if any((segment.started_ms is not None) != has_timecodes for segment in self.segments):
+            raise ValueError("segments must either all have timecodes or all have null timecodes")
+        previous_end: int | None = None
         for segment in self.segments:
-            if segment.started_ms < previous_end:
+            # Timeless review rows still have a stable ordinal and exact text,
+            # but no reliable position in the audio.  Preserve ordering and
+            # overlap checks among every row that does have an interval.
+            if segment.started_ms is None:
+                continue
+            if previous_end is not None and segment.started_ms < previous_end:
                 raise ValueError("segment intervals must be ordered and non-overlapping")
             previous_end = segment.ended_ms
         # Local ffprobe metadata is rounded to whole seconds.  Permit one
         # second of rounding slack while still rejecting a transcript attached
         # to materially different audio.
-        if any(segment.ended_ms > (self.audio_duration_sec + 1) * 1000 for segment in self.segments):
+        if any(
+            segment.ended_ms is not None and segment.ended_ms > (self.audio_duration_sec + 1) * 1000
+            for segment in self.segments
+        ):
             raise ValueError("segment interval must not exceed audio_duration_sec")
         return self
 
@@ -1035,10 +1056,26 @@ def ai_deal_update_values(payload: dict[str, Any]) -> tuple[dict[str, Any], dict
         if not isinstance(evidence, list) or not evidence:
             raise HTTPException(422, f"Нет evidence для {proposal_field}")
         for item in evidence:
-            if not isinstance(item, dict) or not item.get("quote") or (
-                item.get("segment_start_ms") is None and item.get("segment_end_ms") is None
+            if (
+                not isinstance(item, dict)
+                or not item.get("quote")
+                or "segment_start_ms" not in item
+                or "segment_end_ms" not in item
             ):
                 raise HTTPException(422, f"Evidence для {proposal_field} не привязано к сегменту")
+            started = item["segment_start_ms"]
+            ended = item["segment_end_ms"]
+            if (started is None) != (ended is None):
+                raise HTTPException(422, f"Evidence for {proposal_field} has a partial timecode")
+            if started is not None and (
+                not isinstance(started, int)
+                or isinstance(started, bool)
+                or not isinstance(ended, int)
+                or isinstance(ended, bool)
+                or started < 0
+                or ended <= started
+            ):
+                raise HTTPException(422, f"Evidence for {proposal_field} has invalid segment boundaries")
         values[AI_DEAL_FIELD_BY_PROPOSAL[proposal_field]] = value
     if not values:
         raise HTTPException(422, "AI draft не содержит подтверждённых полей сделки")
@@ -1091,7 +1128,7 @@ def _evidence_requires_exact_identity(
     return False
 
 
-def _strict_evidence_identity(evidence: Any, field: str) -> tuple[UUID, int, int, int, str]:
+def _strict_evidence_identity(evidence: Any, field: str) -> tuple[UUID, int, int | None, int | None, str]:
     """Read one v2 citation without coercing unsafe stored JSON values."""
 
     if not isinstance(evidence, dict):
@@ -1102,12 +1139,24 @@ def _strict_evidence_identity(evidence: Any, field: str) -> tuple[UUID, int, int
         raise HTTPException(422, f"Evidence для {field} не привязано к версии транскрипта") from exc
 
     ordinal = evidence.get("segment_ordinal")
-    started = evidence.get("segment_start_ms")
-    ended = evidence.get("segment_end_ms")
-    if any(not isinstance(value, int) or isinstance(value, bool) for value in (ordinal, started, ended)):
+    if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 0:
         raise HTTPException(422, f"Evidence для {field} имеет неверные границы сегмента")
-    if ordinal < 0 or started < 0 or ended <= started:
+    if "segment_start_ms" not in evidence or "segment_end_ms" not in evidence:
         raise HTTPException(422, f"Evidence для {field} имеет неверные границы сегмента")
+    started = evidence["segment_start_ms"]
+    ended = evidence["segment_end_ms"]
+    if started is None or ended is None:
+        if started is not None or ended is not None:
+            raise HTTPException(422, f"Evidence for {field} has a partial timecode")
+    elif (
+        not isinstance(started, int)
+        or isinstance(started, bool)
+        or not isinstance(ended, int)
+        or isinstance(ended, bool)
+        or started < 0
+        or ended <= started
+    ):
+        raise HTTPException(422, f"Evidence for {field} has invalid segment boundaries")
     quote = evidence.get("quote")
     if not isinstance(quote, str) or not quote:
         raise HTTPException(422, f"Evidence для {field} не содержит точную цитату")
@@ -1141,8 +1190,8 @@ def validate_ai_evidence_links(
                        WHERE t.call_id=%s
                          AND s.transcript_id=%s
                          AND s.ordinal=%s
-                         AND s.started_ms=%s
-                         AND s.ended_ms=%s""",
+                          AND s.started_ms IS NOT DISTINCT FROM %s
+                          AND s.ended_ms IS NOT DISTINCT FROM %s""",
                     (call_id, transcript_id, ordinal, started, ended),
                 )
                 source_segment = cursor.fetchone()

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import html
 import hmac
 import json
 import mimetypes
@@ -28,6 +27,8 @@ REVIEW_SCHEMA_VERSION = 1
 REVIEW_SEAL_ALGORITHM = "hmac-sha256"
 REVIEW_SEAL_KEY_ID = "windows-credential-manager-v1"
 MAX_REVIEW_REQUEST_BYTES = 2 * 1024 * 1024
+TIMING_MODE_MANUAL = "manual_audio_boundary"
+TIMING_MODE_TEXT_ONLY = "text_only"
 _TAGGED_TURN = re.compile(r"^\s*\[(?P<label>[^\]]+)\]\s*:\s*(?P<text>.*?)\s*$")
 _ROLE_FOR_LABEL = {"я": "manager", "клиент": "customer"}
 _DISPLAY_LABEL_FOR_ROLE = {"manager": "я", "customer": "Клиент"}
@@ -161,16 +162,37 @@ def _milliseconds(value: Any, field: str) -> int:
 
 def build_reviewed_transcript(
     tagged_text: str,
-    timings: Any,
+    timings: Any | None,
     *,
     audio_duration_sec: int,
     asr_model: str,
     language: str,
 ) -> Transcript:
-    """Validate manual timing data and construct the CRM-safe reviewed text."""
+    """Construct a reviewed transcript without inventing missing timecodes."""
     if not isinstance(audio_duration_sec, int) or audio_duration_sec <= 0:
         raise AgentError("pilot_review_audio_duration_invalid", "Local audio duration is unavailable", retryable=False)
     turns = parse_tagged_transcript(tagged_text)
+    canonical_text = "\n".join(f"[{turn.label}]: {turn.text}" for turn in turns)
+    if timings is None:
+        # Text-only review deliberately has no timestamp estimates.  The CRM
+        # and GigaChat evidence contract preserves the exact segment ordinal
+        # and quote, while presenting the absent time pair as such.
+        return Transcript(
+            canonical_text,
+            [
+                TranscriptSegment(
+                    ordinal=ordinal,
+                    started_ms=None,
+                    ended_ms=None,
+                    role=turn.role,
+                    text=turn.text,
+                    speaker_label="operator_review_text_only",
+                )
+                for ordinal, turn in enumerate(turns)
+            ],
+            asr_model,
+            language,
+        )
     if not isinstance(timings, list) or len(timings) != len(turns):
         raise AgentError("pilot_review_timing_count", "Every reviewed turn needs start and end timing", retryable=False)
 
@@ -200,7 +222,6 @@ def build_reviewed_transcript(
         )
         previous_end = ended_ms
 
-    canonical_text = "\n".join(f"[{turn.label}]: {turn.text}" for turn in turns)
     return Transcript(canonical_text, segments, asr_model, language)
 
 
@@ -239,15 +260,23 @@ def quality_metrics(automatic: Transcript, reviewed: Transcript, *, automatic_ro
     automatic_characters = list("".join(automatic_words))
     reviewed_characters = list("".join(reviewed_words))
 
+    reviewed_intervals_available = all(
+        isinstance(segment.started_ms, int)
+        and not isinstance(segment.started_ms, bool)
+        and isinstance(segment.ended_ms, int)
+        and not isinstance(segment.ended_ms, bool)
+        for segment in reviewed.segments
+    )
+    role_metrics_available = automatic_roles_available and reviewed_intervals_available
     result: dict[str, Any] = {
         "word_error_rate": _rate(automatic_words, reviewed_words),
         "character_error_rate": _rate(automatic_characters, reviewed_characters),
         "reference_word_count": len(reviewed_words),
         "automatic_segment_count": len(automatic.segments),
         "reviewed_turn_count": len(reviewed.segments),
-        "automatic_role_metrics_available": automatic_roles_available,
+        "automatic_role_metrics_available": role_metrics_available,
     }
-    if not automatic_roles_available or not automatic.segments:
+    if not role_metrics_available or not automatic.segments:
         result.update({
             "automatic_role_coverage": None,
             "automatic_role_accuracy_when_assigned": None,
@@ -258,6 +287,11 @@ def quality_metrics(automatic: Transcript, reviewed: Transcript, *, automatic_ro
     known = correct = 0
     for automatic_segment in automatic.segments:
         if automatic_segment.role not in {"manager", "customer"}:
+            continue
+        if not all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in (automatic_segment.started_ms, automatic_segment.ended_ms)
+        ):
             continue
         known += 1
         overlaps = [
@@ -290,7 +324,7 @@ def create_approved_review(
     record: "CallRecord",
     *,
     tagged_text: str,
-    timings: Any,
+    timings: Any | None,
 ) -> Path:
     """Persist one immutable approved review artifact on the home PC only."""
     if not record.transcript_path or not record.audio_sha256 or not record.audio_duration_sec:
@@ -311,9 +345,11 @@ def create_approved_review(
         asr_model=f"operator-reviewed:{automatic.asr_model}",
         language=automatic.language,
     )
+    timing_mode = TIMING_MODE_TEXT_ONLY if timings is None else TIMING_MODE_MANUAL
     review_payload = {
         "tagged_text": reviewed.text,
         "segments": [asdict(segment) for segment in reviewed.segments],
+        "timing_mode": timing_mode,
     }
     artifact = {
         "schema_version": REVIEW_SCHEMA_VERSION,
@@ -373,13 +409,23 @@ def load_approved_review(paths: "AgentPaths", record: "CallRecord") -> Transcrip
         raise AgentError("pilot_review_audio_mismatch", "The approved review does not match local audio metadata", retryable=False)
     if raw.get("review_sha256") != _json_digest(review):
         raise AgentError("pilot_review_changed", "The approved review was changed after approval", retryable=False)
+    timing_mode = review.get("timing_mode", TIMING_MODE_MANUAL)
+    if timing_mode == TIMING_MODE_TEXT_ONLY:
+        timings: Any | None = None
+    elif timing_mode == TIMING_MODE_MANUAL:
+        try:
+            timings = [
+                {"started_ms": segment["started_ms"], "ended_ms": segment["ended_ms"]}
+                for segment in review["segments"]
+            ]
+        except (KeyError, TypeError) as exc:
+            raise AgentError("pilot_review_invalid", "The approved review has invalid segments", retryable=False) from exc
+    else:
+        raise AgentError("pilot_review_invalid", "The approved review has an unknown timing mode", retryable=False)
     try:
         transcript = build_reviewed_transcript(
             str(review["tagged_text"]),
-            [
-                {"started_ms": segment["started_ms"], "ended_ms": segment["ended_ms"]}
-                for segment in review["segments"]
-            ],
+            timings,
             audio_duration_sec=record.audio_duration_sec,
             asr_model=f"operator-reviewed:{source['asr_model']}",
             language=str(source["language"]),
@@ -403,31 +449,11 @@ def _default_review_text(automatic: Transcript) -> str:
     return _normalized_text(" ".join(segment.text for segment in automatic.segments))
 
 
-def _review_speech_bounds(automatic: Transcript, audio_duration_sec: int) -> tuple[int, int]:
-    """Return the observed speech envelope without inventing precise turns."""
-
-    duration_ms = max(0, audio_duration_sec * 1000)
-    observed = [
-        (segment.started_ms, segment.ended_ms)
-        for segment in automatic.segments
-        if 0 <= segment.started_ms < segment.ended_ms <= duration_ms
-    ]
-    if not observed:
-        return 0, duration_ms
-    started_ms = min(started for started, _ended in observed)
-    ended_ms = max(ended for _started, ended in observed)
-    if ended_ms <= started_ms:
-        return 0, duration_ms
-    return started_ms, ended_ms
-
-
 @dataclass
 class _ReviewContext:
     paths: "AgentPaths"
     record: "CallRecord"
     draft_text: str
-    speech_started_ms: int = 0
-    speech_ended_ms: int = 0
     approved_path: Path | None = None
 
 
@@ -539,14 +565,7 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
 
     def _serve_editor(self) -> None:
         context = self.server.context
-        duration_ms = context.record.audio_duration_sec * 1000 if context.record.audio_duration_sec else 0
-        speech_ended_ms = context.speech_ended_ms or duration_ms
-        page = _editor_html(
-            context.draft_text,
-            duration_ms,
-            context.speech_started_ms,
-            speech_ended_ms,
-        )
+        page = _editor_html(context.draft_text)
         body = page.encode("utf-8")
         self._headers(200, "text/html; charset=utf-8", len(body))
         self.wfile.write(body)
@@ -601,75 +620,17 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
             remaining = length
             while remaining and (block := handle.read(min(1024 * 1024, remaining))):
                 self.wfile.write(block)
-                remaining -= len(block)
+        remaining -= len(block)
 
 
-def _legacy_editor_html(draft_text: str, duration_ms: int) -> str:
-    escaped_draft = html.escape(draft_text)
-    return rf"""<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MO54 Calls — локальная проверка</title>
-<style>
-body{{font-family:system-ui,sans-serif;max-width:1000px;margin:2rem auto;padding:0 1rem;color:#17212b;line-height:1.45}} textarea{{box-sizing:border-box;width:100%;min-height:20rem;padding:.75rem;font:14px ui-monospace,monospace;line-height:1.5}} input{{width:8rem}} button{{min-height:2.5rem;padding:.55rem .9rem;margin:.75rem .5rem .75rem 0;cursor:pointer}} button:focus-visible,input:focus-visible,textarea:focus-visible{{outline:3px solid #1769aa;outline-offset:2px}} button:disabled{{cursor:wait;opacity:.65}} .turn{{display:grid;grid-template-columns:7rem 1fr 13rem 13rem;gap:.75rem;margin:.6rem 0;padding:.6rem;border-block-end:1px solid #d9e1e8;align-items:start}} .turn span{{overflow-wrap:anywhere}} .time{{display:flex;gap:.25rem;align-items:center}} .time button{{min-height:2rem;margin:0;padding:.3rem .45rem;font-size:.85rem}} .error{{color:#9b1c1c;font-weight:600}} .success{{color:#176b3a;font-weight:600}} .actions{{display:flex;gap:.5rem;flex-wrap:wrap}} small{{color:#57606a}} @media(max-width:720px){{.turn{{grid-template-columns:1fr}} .time{{max-width:22rem}}}}
-</style></head><body>
-<h1>Локальная проверка транскрипта</h1>
-<p id="instructions">Страница доступна только на этом ПК. Сначала проверьте текст с тегами ролей, затем для каждой реплики отметьте начало и конец по плееру. Аудио и текст не передаются до отдельной команды доставки.</p>
-<audio controls preload="metadata" src="/audio"></audio>
-<p><small>Длительность аудио: {duration_ms} мс. Используйте только теги <code>[я]</code> и <code>[Клиент]</code>.</small></p>
-<label for="text"><strong>Утверждённый текст</strong></label>
-<textarea id="text" spellcheck="false" aria-describedby="instructions">{escaped_draft}</textarea>
-<div class="actions"><button type="button" id="prepare">Разметить реплики</button><button type="button" id="cancel">Отменить без сохранения</button></div>
-<div id="turns" aria-label="Временные границы реплик"></div><p id="message" class="error" aria-live="polite"></p>
-<button type="button" id="approve">Утвердить локальную версию</button>
-<script>
-const text=document.getElementById('text'), turns=document.getElementById('turns'), message=document.getElementById('message'), audio=document.querySelector('audio');
-const errorMessages={{pilot_review_text_invalid:'Текст должен состоять из реплик.',pilot_review_tag_invalid:'Используйте только теги [я] и [Клиент].',pilot_review_tag_missing:'Первая реплика должна начинаться с тега роли.',pilot_review_text_empty:'Заполните текст каждой реплики.',pilot_review_timing_count:'Укажите начало и конец для каждой реплики.',pilot_review_timing_invalid:'Время вводится целым числом миллисекунд; конец должен быть позже начала.',pilot_review_timing_overlap:'Реплики не должны пересекаться и должны идти по порядку.',pilot_review_timing_out_of_bounds:'Время реплики выходит за пределы длительности аудио.',pilot_review_already_approved:'Эта версия уже была утверждена.',local_origin_required:'Окно проверки нужно открыть только с этого ПК.'}};
-function showError(code){{message.className='error';message.textContent=errorMessages[code]||'Не удалось утвердить версию. Проверьте текст и времена.';}}
-function parse(){{
-  const entries=[]; let current=null;
-  for(const raw of text.value.split(/\r?\n/)){{ const line=raw.trim(); if(!line) continue;
-    const hit=line.match(/^\s*\[([^\]]+)\]\s*:\s*(.*?)\s*$/); if(hit){{
-      const label=hit[1].trim().toLocaleLowerCase('ru-RU'); if(label!=='я' && label!=='клиент') throw Error('Каждая реплика должна начинаться с [я] или [Клиент].');
-      if(!hit[2].trim()) throw Error('Пустая реплика не допускается.'); current={{label:label==='я'?'я':'Клиент',text:hit[2].trim()}}; entries.push(current);
-    }} else {{ if(!current) throw Error('Первая реплика должна начинаться с тега роли.'); current.text += ' '+line; }}
-  }} if(!entries.length) throw Error('Введите хотя бы одну реплику.'); return entries;
-}}
-function render(){{ message.textContent=''; let entries; try{{entries=parse();}}catch(error){{message.textContent=error.message; return;}}
-  turns.replaceChildren(); entries.forEach((entry,index)=>{{const row=document.createElement('div');row.className='turn';row.dataset.index=index;
-    const role=document.createElement('strong');role.textContent='['+entry.label+']'; const utterance=document.createElement('span');utterance.textContent=entry.text;
-    const start=document.createElement('input');start.name='started_ms';start.inputMode='numeric';start.placeholder='начало, мс';start.setAttribute('aria-label','Начало реплики '+(index+1)+' в миллисекундах'); const setStart=document.createElement('button');setStart.type='button';setStart.textContent='Взять с плеера';setStart.setAttribute('aria-label','Взять начало реплики '+(index+1)+' с текущей позиции плеера');setStart.addEventListener('click',()=>start.value=Math.round(audio.currentTime*1000)); const startWrap=document.createElement('span');startWrap.className='time';startWrap.append(start,setStart);
-    const end=document.createElement('input');end.name='ended_ms';end.inputMode='numeric';end.placeholder='конец, мс';end.setAttribute('aria-label','Конец реплики '+(index+1)+' в миллисекундах'); const setEnd=document.createElement('button');setEnd.type='button';setEnd.textContent='Взять с плеера';setEnd.setAttribute('aria-label','Взять конец реплики '+(index+1)+' с текущей позиции плеера');setEnd.addEventListener('click',()=>end.value=Math.round(audio.currentTime*1000)); const endWrap=document.createElement('span');endWrap.className='time';endWrap.append(end,setEnd);
-    row.append(role,utterance,startWrap,endWrap);turns.append(row); }});
-}}
-document.getElementById('prepare').addEventListener('click',render);
-document.getElementById('cancel').addEventListener('click',async()=>{{await fetch('/cancel',{{method:'POST'}});message.className='';message.textContent='Проверка отменена без сохранения.';}});
-document.getElementById('approve').addEventListener('click',async()=>{{
-  const approve=document.getElementById('approve');message.textContent=''; if(!turns.children.length) render(); if(!turns.children.length) return; approve.disabled=true;
-  const timings=[...turns.children].map(row=>({{started_ms:row.querySelector('[name=started_ms]').value,ended_ms:row.querySelector('[name=ended_ms]').value}}));
-  try{{const response=await fetch('/approve',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{tagged_text:text.value,timings}})}});const result=await response.json();if(!response.ok){{showError(result.error);approve.disabled=false;return;}} message.className='success';message.textContent='Локальная версия утверждена. Окно можно закрыть.';}}catch(_error){{showError('network');approve.disabled=false;}}
-}});
-</script></body></html>"""
+def _editor_html(draft_text: str) -> str:
+    """Render a text-only, keyboard-first local review editor.
 
-
-def _editor_html(
-    draft_text: str,
-    duration_ms: int,
-    speech_started_ms: int,
-    speech_ended_ms: int,
-) -> str:
-    """Render the text-first local review editor.
-
-    A reviewer edits ordinary text.  Enter at the audio playhead creates a
-    speaker boundary and alternates the role; the only persisted timings are
-    those captured from that local playhead.  This keeps the review practical
-    without fabricating evidence timestamps from ASR chunks or text length.
+    The operator controls only text and speaker changes.  Audio remains a
+    local optional reference, while missing per-turn timecodes are explicitly
+    represented as ``null`` all the way to the CRM rather than estimated.
     """
 
-    duration_ms = max(0, int(duration_ms))
-    speech_started_ms = min(max(0, int(speech_started_ms)), duration_ms)
-    speech_ended_ms = min(max(speech_started_ms, int(speech_ended_ms)), duration_ms)
-    if speech_ended_ms <= speech_started_ms:
-        speech_started_ms, speech_ended_ms = 0, duration_ms
     initial_text_json = (
         json.dumps(draft_text, ensure_ascii=False)
         .replace("<", "\\u003c")
@@ -681,107 +642,25 @@ def _editor_html(
 <title>MO54 Calls — локальная проверка</title>
 <style>
 :root{color-scheme:light;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#17212b;background:#f4f7fa}
-*{box-sizing:border-box} body{margin:0;line-height:1.45}.page{max-width:960px;margin:0 auto;padding:clamp(1rem,4vw,3rem) 1rem 4rem}
-h1{margin:0;font-size:clamp(1.45rem,3vw,2rem);letter-spacing:-.02em}.lead{max-width:72ch;color:#425466;margin:.65rem 0 1.25rem}
-.card{background:#fff;border:1px solid #d9e1e8;border-radius:14px;box-shadow:0 8px 25px rgba(28,45,64,.06);padding:clamp(1rem,3vw,1.5rem);margin:1rem 0}
-.guide{display:grid;grid-template-columns:auto 1fr;gap:.55rem .75rem;margin:0;padding:0;list-style:none}.guide b{display:inline-grid;place-items:center;width:1.65rem;height:1.65rem;border-radius:999px;background:#e7f0fa;color:#155f98}
-.controls{display:flex;align-items:center;gap:.75rem 1rem;justify-content:space-between;flex-wrap:wrap;margin:.9rem 0}.first-speaker{font-weight:650}.first-speaker select{margin-left:.45rem;font:inherit;padding:.35rem .5rem;border:1px solid #9aacbd;border-radius:7px;background:#fff;color:#17212b}.playhead{font-variant-numeric:tabular-nums;color:#526576}
-audio{display:block;width:100%;margin:1rem 0}.hint{font-size:.94rem;color:#526576;margin:.65rem 0 0}.turns{margin-top:1rem;border-top:1px solid #d9e1e8}
-.turn{display:grid;grid-template-columns:7.4rem minmax(0,1fr);gap:.75rem;padding:1rem 0;border-bottom:1px solid #d9e1e8;align-items:start}.role{min-height:2.5rem;width:100%;border:1px solid #a8c2d9;border-radius:999px;background:#eef6fd;color:#154f7d;font-weight:700;cursor:pointer}.role.customer{background:#f7f0e4;border-color:#d8ba82;color:#735215}
-.turn textarea{resize:vertical;width:100%;min-height:4.75rem;border:1px solid #aebdca;border-radius:9px;padding:.7rem .75rem;color:#17212b;background:#fff;font:inherit;line-height:1.5}.turn textarea:focus,.role:focus-visible,.first-speaker select:focus-visible,button:focus-visible{outline:3px solid #1769aa;outline-offset:2px}.turn textarea:focus{border-color:#1769aa}
-.actions{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap;margin-top:1rem}.primary,.secondary{min-height:2.7rem;border-radius:8px;padding:.55rem .9rem;font:inherit;font-weight:650;cursor:pointer}.primary{border:1px solid #0d5c96;background:#1269a8;color:#fff}.secondary{border:1px solid #b2bfca;background:#fff;color:#263847}.primary:disabled{cursor:wait;opacity:.65}.message{min-height:1.45rem;margin:.8rem 0 0;font-weight:650}.message.error{color:#9b1c1c}.message.success{color:#176b3a}.privacy{font-size:.9rem;color:#526576;margin:.95rem 0 0}
-@media(max-width:620px){.turn{grid-template-columns:1fr}.role{width:auto;padding-inline:1rem}.guide{grid-template-columns:auto 1fr}}
+*{box-sizing:border-box}body{margin:0;line-height:1.45}.page{max-width:960px;margin:0 auto;padding:clamp(1rem,4vw,3rem) 1rem 4rem}h1{margin:0;font-size:clamp(1.45rem,3vw,2rem);letter-spacing:-.02em}.lead{max-width:72ch;color:#425466;margin:.65rem 0 1.25rem}.card{background:#fff;border:1px solid #d9e1e8;border-radius:14px;box-shadow:0 8px 25px rgba(28,45,64,.06);padding:clamp(1rem,3vw,1.5rem);margin:1rem 0}.guide{display:grid;grid-template-columns:auto 1fr;gap:.55rem .75rem;margin:0;padding:0;list-style:none}.guide b{display:inline-grid;place-items:center;width:1.65rem;height:1.65rem;border-radius:999px;background:#e7f0fa;color:#155f98}.controls{display:flex;align-items:center;gap:.75rem 1rem;justify-content:space-between;flex-wrap:wrap;margin:.9rem 0}.first-speaker{font-weight:650}.first-speaker select{margin-left:.45rem;font:inherit;padding:.35rem .5rem;border:1px solid #9aacbd;border-radius:7px;background:#fff;color:#17212b}audio{display:block;width:100%;margin:1rem 0}.hint{font-size:.94rem;color:#526576;margin:.65rem 0 0}.turns{margin-top:1rem;border-top:1px solid #d9e1e8}.turn{display:grid;grid-template-columns:7.4rem minmax(0,1fr);gap:.75rem;padding:1rem 0;border-bottom:1px solid #d9e1e8;align-items:start}.role{min-height:2.5rem;width:100%;border:1px solid #a8c2d9;border-radius:999px;background:#eef6fd;color:#154f7d;font-weight:700;cursor:pointer}.role.customer{background:#f7f0e4;border-color:#d8ba82;color:#735215}.turn textarea{resize:vertical;width:100%;min-height:4.75rem;border:1px solid #aebdca;border-radius:9px;padding:.7rem .75rem;color:#17212b;background:#fff;font:inherit;line-height:1.5}.turn textarea:focus,.role:focus-visible,.first-speaker select:focus-visible,button:focus-visible{outline:3px solid #1769aa;outline-offset:2px}.turn textarea:focus{border-color:#1769aa}.actions{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap;margin-top:1rem}.primary,.secondary{min-height:2.7rem;border-radius:8px;padding:.55rem .9rem;font:inherit;font-weight:650;cursor:pointer}.primary{border:1px solid #0d5c96;background:#1269a8;color:#fff}.secondary{border:1px solid #b2bfca;background:#fff;color:#263847}.primary:disabled{cursor:wait;opacity:.65}.message{min-height:1.45rem;margin:.8rem 0 0;font-weight:650}.message.error{color:#9b1c1c}.message.success{color:#176b3a}.privacy{font-size:.9rem;color:#526576;margin:.95rem 0}@media(max-width:620px){.turn{grid-template-columns:1fr}.role{width:auto;padding-inline:1rem}.guide{grid-template-columns:auto 1fr}}
 </style></head><body><main class="page">
 <h1>Проверка диалога</h1>
-<p class="lead">Исправляйте текст как в обычном редакторе. Когда начинает говорить другой человек, поставьте курсор перед его первой фразой и нажмите <kbd>Enter</kbd> в момент смены в аудио.</p>
-<section class="card" aria-label="Как размечать разговор"><ol class="guide"><li><b>1</b></li><li>Выберите, кто сказал первую фразу.</li><li><b>2</b></li><li>Слушайте запись. В точке смены говорящего поставьте курсор в тексте и нажмите <kbd>Enter</kbd>.</li><li><b>3</b></li><li>Новая строка получит роль другого человека сама. Если ошиблись, нажмите <kbd>Backspace</kbd> в начале строки — реплики снова объединятся.</li></ol></section>
-<section class="card" aria-label="Редактор диалога">
-  <div class="controls"><label class="first-speaker" for="first-speaker">Первым говорит<select id="first-speaker" data-testid="first-speaker"><option value="manager">Я</option><option value="customer">Клиент</option></select></label><output id="playhead" class="playhead" aria-live="off">Позиция аудио: 0:00</output></div>
-  <audio id="audio" controls preload="metadata" src="/audio"></audio>
-  <p class="hint">Обычный <kbd>Enter</kbd> создаёт смену говорящего и сохраняет позицию аудио. <kbd>Shift+Enter</kbd> — перенос внутри той же реплики. Роль в плашке можно переключить кликом.</p>
-  <div id="turns" class="turns" aria-label="Реплики разговора" data-testid="turns"></div>
-  <div class="actions"><button type="button" id="approve" class="primary" data-testid="approve">Утвердить локальную версию</button><button type="button" id="cancel" class="secondary">Отменить без сохранения</button></div>
-  <p id="message" class="message" role="status" aria-live="polite"></p>
-  <p class="privacy">Аудио, текст и разметка остаются на этом ПК до отдельной команды доставки в CRM.</p>
-</section></main>
-<script>
-const audio=document.getElementById('audio');
-const turnsElement=document.getElementById('turns');
-const firstSpeaker=document.getElementById('first-speaker');
-const message=document.getElementById('message');
-const approve=document.getElementById('approve');
-const initialText=__INITIAL_TEXT_JSON__;
-const durationMs=__AUDIO_DURATION_MS__;
-const speechStartMs=__SPEECH_STARTED_MS__;
-const speechEndMs=__SPEECH_ENDED_MS__;
-const labels={manager:'Я',customer:'Клиент'};
-const otherRole=role=>role==='manager'?'customer':'manager';
-let turns=[{role:firstSpeaker.value,text:initialText,started_ms:speechStartMs}];
-
-function cleanText(value){return String(value??'').replace(/\s+/g,' ').trim();}
-function formatTime(milliseconds){const seconds=Math.max(0,Math.round(milliseconds/1000));return `${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,'0')}`;}
-function updatePlayhead(){document.getElementById('playhead').textContent=`Позиция аудио: ${formatTime(Math.round(audio.currentTime*1000))}`;}
-function setMessage(value,kind='error'){message.className=`message ${kind}`;message.textContent=value;}
-function clearMessage(){message.className='message';message.textContent='';}
-function endOfTurn(index){return index+1<turns.length?turns[index+1].started_ms:speechEndMs;}
-
+<p class="lead">Работайте только с текстом. Когда начинается реплика другого человека, поставьте курсор перед её первой фразой и нажмите <kbd>Enter</kbd>.</p>
+<section class="card" aria-label="Как разделять разговор"><ol class="guide"><li><b>1</b></li><li>Выберите, кто сказал первую фразу.</li><li><b>2</b></li><li>Исправляйте текст как обычно. Перед первой фразой следующего человека нажмите <kbd>Enter</kbd>.</li><li><b>3</b></li><li>Роль новой строки переключится сама. Если ошиблись, нажмите <kbd>Backspace</kbd> в начале новой строки.</li></ol></section>
+<section class="card" aria-label="Редактор диалога"><div class="controls"><label class="first-speaker" for="first-speaker">Первым говорит<select id="first-speaker" data-testid="first-speaker"><option value="manager">Я</option><option value="customer">Клиент</option></select></label></div><p class="hint">Аудио можно включить только для проверки спорного места — ставить его на границы реплик не нужно. <kbd>Shift+Enter</kbd> оставляет перенос внутри реплики. Роль в плашке можно переключить кликом.</p><audio id="audio" controls preload="metadata" src="/audio"></audio><div id="turns" class="turns" aria-label="Реплики разговора" data-testid="turns"></div><div class="actions"><button type="button" id="approve" class="primary" data-testid="approve">Утвердить локальную версию</button><button type="button" id="cancel" class="secondary">Отменить без сохранения</button></div><p id="message" class="message" role="status" aria-live="polite"></p><p class="privacy">Временные отметки реплик не создаются. Аудио и текст остаются на этом ПК до отдельной команды доставки в CRM.</p></section>
+</main><script>
+const turnsElement=document.getElementById('turns');const firstSpeaker=document.getElementById('first-speaker');const message=document.getElementById('message');const approve=document.getElementById('approve');const initialText=__INITIAL_TEXT_JSON__;const labels={manager:'Я',customer:'Клиент'};const otherRole=role=>role==='manager'?'customer':'manager';let turns=[{role:firstSpeaker.value,text:initialText}];
+function cleanText(value){return String(value??'').replace(/\s+/g,' ').trim();}function setMessage(value,kind='error'){message.className=`message ${kind}`;message.textContent=value;}function clearMessage(){message.className='message';message.textContent='';}
 function focusTurn(index,caret){const field=turnsElement.querySelector(`textarea[data-turn-index="${index}"]`);if(!field)return;field.focus();const point=Math.min(Math.max(0,caret),field.value.length);field.setSelectionRange(point,point);}
-function render(focus){
-  turnsElement.replaceChildren();
-  turns.forEach((turn,index)=>{
-    const row=document.createElement('div');row.className='turn';
-    const role=document.createElement('button');role.type='button';role.className=`role ${turn.role}`;role.dataset.testid='turn-role';role.textContent=labels[turn.role];role.setAttribute('aria-label',`Сменить роль реплики ${index+1}, сейчас: ${labels[turn.role]}`);
-    role.addEventListener('click',()=>{turn.role=otherRole(turn.role);render({index,caret:0});setMessage(`Роль реплики ${index+1}: ${labels[turn.role]}.`,'success');});
-    const field=document.createElement('textarea');field.dataset.turnIndex=String(index);field.value=turn.text;field.placeholder='Текст реплики';field.setAttribute('aria-label',`Реплика ${index+1}, ${labels[turn.role]}`);
-    field.addEventListener('input',()=>{turn.text=field.value;clearMessage();});
-    field.addEventListener('keydown',event=>handleEditorKey(event,index,field));
-    row.append(role,field);turnsElement.append(row);
-  });
-  if(focus)requestAnimationFrame(()=>focusTurn(focus.index,focus.caret));
-}
-
-function splitTurnAtPlayhead(index,field){
-  if(field.selectionStart!==field.selectionEnd){setMessage('Сначала снимите выделение, затем поставьте курсор перед первой фразой другого человека.');return;}
-  const boundary=Math.round(audio.currentTime*1000);const start=turns[index].started_ms;const end=endOfTurn(index);
-  if(!Number.isFinite(audio.currentTime)||boundary<=start||boundary>=end||boundary<0||boundary>durationMs){setMessage('Поставьте аудио в точку смены — внутри текущей реплики — и нажмите Enter ещё раз.');return;}
-  const caret=field.selectionStart;const before=field.value.slice(0,caret).replace(/\s+$/,'');const after=field.value.slice(caret).replace(/^\s+/,'');
-  if(!cleanText(before)||!cleanText(after)){setMessage('Поставьте курсор между двумя фразами: текст до и после него должен остаться в разных репликах.');return;}
-  turns[index].text=before;turns.splice(index+1,0,{role:otherRole(turns[index].role),text:after,started_ms:boundary});clearMessage();render({index:index+1,caret:0});
-}
-
-function mergeTurnWithPrevious(index){
-  if(index===0)return;const previous=turns[index-1];const current=turns[index];const caret=previous.text.length+(previous.text&&current.text?' ':'');previous.text=[previous.text.trimEnd(),current.text.trimStart()].filter(Boolean).join(' ');turns.splice(index,1);clearMessage();render({index:index-1,caret});
-}
-
-function handleEditorKey(event,index,field){
-  if(event.isComposing)return;
-  if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();splitTurnAtPlayhead(index,field);return;}
-  if(event.key==='Backspace'&&index>0&&field.selectionStart===0&&field.selectionEnd===0){event.preventDefault();mergeTurnWithPrevious(index);}
-}
-
+function render(focus){turnsElement.replaceChildren();turns.forEach((turn,index)=>{const row=document.createElement('div');row.className='turn';const role=document.createElement('button');role.type='button';role.className=`role ${turn.role}`;role.dataset.testid='turn-role';role.textContent=labels[turn.role];role.setAttribute('aria-label',`Сменить роль реплики ${index+1}, сейчас: ${labels[turn.role]}`);role.addEventListener('click',()=>{turn.role=otherRole(turn.role);render({index,caret:0});setMessage(`Роль реплики ${index+1}: ${labels[turn.role]}.`,'success');});const field=document.createElement('textarea');field.dataset.turnIndex=String(index);field.value=turn.text;field.placeholder='Текст реплики';field.setAttribute('aria-label',`Реплика ${index+1}, ${labels[turn.role]}`);field.addEventListener('input',()=>{turn.text=field.value;clearMessage();});field.addEventListener('keydown',event=>handleEditorKey(event,index,field));row.append(role,field);turnsElement.append(row);});if(focus)requestAnimationFrame(()=>focusTurn(focus.index,focus.caret));}
+function splitTurn(index,field){if(field.selectionStart!==field.selectionEnd){setMessage('Сначала снимите выделение, затем поставьте курсор перед первой фразой другого человека.');return;}const caret=field.selectionStart;const before=field.value.slice(0,caret).replace(/\s+$/,'');const after=field.value.slice(caret).replace(/^\s+/,'');if(!cleanText(before)||!cleanText(after)){setMessage('Поставьте курсор между двумя фразами: текст до и после него должен остаться в разных репликах.');return;}turns[index].text=before;turns.splice(index+1,0,{role:otherRole(turns[index].role),text:after});clearMessage();render({index:index+1,caret:0});}
+function mergeTurnWithPrevious(index){if(index===0)return;const previous=turns[index-1];const current=turns[index];const caret=previous.text.length+(previous.text&&current.text?' ':'');previous.text=[previous.text.trimEnd(),current.text.trimStart()].filter(Boolean).join(' ');turns.splice(index,1);clearMessage();render({index:index-1,caret});}
+function handleEditorKey(event,index,field){if(event.isComposing)return;if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();splitTurn(index,field);return;}if(event.key==='Backspace'&&index>0&&field.selectionStart===0&&field.selectionEnd===0){event.preventDefault();mergeTurnWithPrevious(index);}}
 function resetRolesFromFirstSpeaker(){let role=firstSpeaker.value;turns=turns.map(turn=>{const next={...turn,role};role=otherRole(role);return next;});clearMessage();render();}
-function reviewedPayload(){
-  if(!turns.length)throw new Error('Добавьте хотя бы одну реплику.');
-  const reviewed=turns.map((turn,index)=>{const text=cleanText(turn.text);if(!text)throw new Error(`Заполните текст реплики ${index+1}.`);return {...turn,text};});
-  const timings=reviewed.map((turn,index)=>({started_ms:turn.started_ms,ended_ms:index+1<reviewed.length?reviewed[index+1].started_ms:speechEndMs}));
-  return {tagged_text:reviewed.map(turn=>`[${labels[turn.role]}]: ${turn.text}`).join('\n'),timings};
-}
-
-audio.addEventListener('timeupdate',updatePlayhead);audio.addEventListener('loadedmetadata',updatePlayhead);firstSpeaker.addEventListener('change',resetRolesFromFirstSpeaker);
-document.getElementById('approve').addEventListener('click',async()=>{
-  let payload;try{payload=reviewedPayload();}catch(error){setMessage(error.message);return;}approve.disabled=true;clearMessage();
-  try{const response=await fetch('/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const result=await response.json();if(!response.ok){setMessage('Не удалось утвердить версию. Проверьте текст и границы реплик.');approve.disabled=false;return;}setMessage('Локальная версия утверждена. Окно можно закрыть.','success');}
-  catch(_error){setMessage('Не удалось сохранить локальную версию. Проверьте соединение с локальным редактором.');approve.disabled=false;}
-});
-document.getElementById('cancel').addEventListener('click',async()=>{await fetch('/cancel',{method:'POST'});setMessage('Проверка отменена без сохранения.','success');});
-render();updatePlayhead();
+function reviewedPayload(){if(!turns.length)throw new Error('Добавьте хотя бы одну реплику.');const reviewed=turns.map((turn,index)=>{const text=cleanText(turn.text);if(!text)throw new Error(`Заполните текст реплики ${index+1}.`);return {...turn,text};});return {tagged_text:reviewed.map(turn=>`[${labels[turn.role]}]: ${turn.text}`).join('\n'),timings:null};}
+firstSpeaker.addEventListener('change',resetRolesFromFirstSpeaker);document.getElementById('approve').addEventListener('click',async()=>{let payload;try{payload=reviewedPayload();}catch(error){setMessage(error.message);return;}approve.disabled=true;clearMessage();try{const response=await fetch('/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const result=await response.json();if(!response.ok){setMessage('Не удалось утвердить версию. Проверьте текст и роли реплик.');approve.disabled=false;return;}setMessage('Локальная версия утверждена. Окно можно закрыть.','success');}catch(_error){setMessage('Не удалось сохранить локальную версию. Проверьте соединение с локальным редактором.');approve.disabled=false;}});document.getElementById('cancel').addEventListener('click',async()=>{await fetch('/cancel',{method:'POST'});setMessage('Проверка отменена без сохранения.','success');});render();
 </script></body></html>"""
-    return (
-        page.replace("__INITIAL_TEXT_JSON__", initial_text_json)
-        .replace("__AUDIO_DURATION_MS__", str(duration_ms))
-        .replace("__SPEECH_STARTED_MS__", str(speech_started_ms))
-        .replace("__SPEECH_ENDED_MS__", str(speech_ended_ms))
-    )
+    return page.replace("__INITIAL_TEXT_JSON__", initial_text_json)
 
 
 def review_pilot(
@@ -802,14 +681,7 @@ def review_pilot(
         automatic = Transcript.from_path(preserve_automatic_baseline(record.transcript_path))
     except (OSError, KeyError, TypeError, ValueError) as exc:
         raise AgentError("pilot_review_source_invalid", "The local ASR source is invalid", retryable=False) from exc
-    speech_started_ms, speech_ended_ms = _review_speech_bounds(automatic, record.audio_duration_sec)
-    context = _ReviewContext(
-        paths,
-        record,
-        _default_review_text(automatic),
-        speech_started_ms,
-        speech_ended_ms,
-    )
+    context = _ReviewContext(paths, record, _default_review_text(automatic))
     server = _ReviewHTTPServer(("127.0.0.1", 0), context)
     url = f"http://127.0.0.1:{server.server_port}/"
     try:

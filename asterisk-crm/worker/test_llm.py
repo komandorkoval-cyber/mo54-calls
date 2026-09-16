@@ -53,6 +53,20 @@ class InsightValidationTest(unittest.TestCase):
             "qualified",
         )
 
+    def test_accepts_exact_null_timecode_pair_for_a_timeless_segment(self):
+        timeless = [{
+            **SEGMENTS[0],
+            "started_ms": None,
+            "ended_ms": None,
+        }]
+        valid = json.loads(json.dumps(VALID))
+        valid["evidence"][0]["segment_start_ms"] = None
+        valid["evidence"][0]["segment_end_ms"] = None
+        self.assertEqual(
+            _parse(json.dumps(valid), segments=timeless)["summary"],
+            VALID["summary"],
+        )
+
     def test_strips_markdown_fence(self):
         self.assertEqual(
             _parse(f"```json\n{json.dumps(VALID)}\n```", segments=SEGMENTS)["confidence"],
@@ -97,6 +111,12 @@ class InsightValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(LLMError, "identity"):
             _parse(json.dumps(invalid), segments=SEGMENTS)
 
+    def test_rejects_evidence_with_a_partial_null_timecode_pair(self):
+        invalid = json.loads(json.dumps(VALID))
+        invalid["evidence"][0]["segment_start_ms"] = None
+        with self.assertRaisesRegex(LLMError, "pair of nulls"):
+            _parse(json.dumps(invalid), segments=SEGMENTS)
+
     def test_rejects_evidence_when_ordinal_does_not_match_the_stored_segment(self):
         invalid = json.loads(json.dumps(VALID))
         invalid["evidence"][0]["segment_ordinal"] = 1
@@ -122,6 +142,19 @@ class InsightValidationTest(unittest.TestCase):
             "ordinal": 0, "role": "customer", "started_ms": 1200,
             "ended_ms": 3800, "text": SEGMENTS[0]["text"],
         }])
+
+    def test_analysis_input_preserves_a_timeless_segment_as_a_null_pair(self):
+        body = json.loads(build_analysis_input([{
+            **SEGMENTS[0],
+            "started_ms": None,
+            "ended_ms": None,
+        }]))
+        self.assertEqual(body["segments"][0]["started_ms"], None)
+        self.assertEqual(body["segments"][0]["ended_ms"], None)
+
+    def test_analysis_input_rejects_partial_source_timecode(self):
+        with self.assertRaisesRegex(LLMError, "pair of nulls"):
+            build_analysis_input([{**SEGMENTS[0], "started_ms": None}])
 
     def test_summarize_sends_the_timeline_and_validates_the_returned_evidence(self):
         captured = {}

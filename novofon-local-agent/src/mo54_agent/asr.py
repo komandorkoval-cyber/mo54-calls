@@ -25,8 +25,11 @@ CHUNK_SECONDS = 24
 @dataclass(frozen=True)
 class TranscriptSegment:
     ordinal: int
-    started_ms: int
-    ended_ms: int
+    # A human may approve the text and roles without manually placing audio
+    # boundaries.  In that text-only review mode both values are deliberately
+    # absent rather than guessed from word count or ASR chunks.
+    started_ms: int | None
+    ended_ms: int | None
     role: str
     text: str
     speaker_label: str | None = None

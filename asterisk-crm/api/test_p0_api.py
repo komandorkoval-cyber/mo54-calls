@@ -405,6 +405,26 @@ class EvidenceIdentityTests(unittest.TestCase):
             )
         self.assertEqual(wrong_case.exception.status_code, 422)
 
+    def test_v2_evidence_matches_an_exact_timeless_segment(self):
+        transcript_id = uuid4()
+        cursor = ExactEvidenceCursor(transcript_id, started_ms=None, ended_ms=None)
+        app.validate_ai_evidence_links(
+            cursor,
+            77,
+            self.v2_fields(transcript_id, segment_start_ms=None, segment_end_ms=None),
+            "p0-deal-update-v2-evidence",
+        )
+        self.assertEqual(cursor.executed[0][1][1:], (transcript_id, 3, None, None))
+        self.assertIn("IS NOT DISTINCT FROM", cursor.executed[0][0])
+
+    def test_deal_draft_precheck_allows_a_complete_timeless_pair(self):
+        payload = deal_update_payload()
+        evidence = payload["proposed_fields"]["pain_primary"]["evidence"][0]
+        evidence["segment_start_ms"] = None
+        evidence["segment_end_ms"] = None
+        values, _fields, _baseline = app.ai_deal_update_values(payload)
+        self.assertEqual(values["pain_primary"], payload["proposed_fields"]["pain_primary"]["proposed_value"])
+
     def test_v2_evidence_rejects_another_transcript_version_and_any_non_exact_boundary(self):
         transcript_id = uuid4()
         for label, overrides in (
@@ -436,6 +456,18 @@ class EvidenceIdentityTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as incomplete:
             app.validate_ai_evidence_links(ExactEvidenceCursor(transcript_id), 77, partial)
         self.assertEqual(incomplete.exception.status_code, 422)
+
+        partial_timecode = self.v2_fields(transcript_id, segment_start_ms=None)
+        with self.assertRaises(HTTPException) as partial_timecode_rejected:
+            app.validate_ai_evidence_links(ExactEvidenceCursor(transcript_id), 77, partial_timecode)
+        self.assertEqual(partial_timecode_rejected.exception.status_code, 422)
+
+        missing_timecode = self.v2_fields(transcript_id)
+        del missing_timecode["pain_primary"]["evidence"][0]["segment_start_ms"]
+        del missing_timecode["pain_primary"]["evidence"][0]["segment_end_ms"]
+        with self.assertRaises(HTTPException) as missing_timecode_rejected:
+            app.validate_ai_evidence_links(ExactEvidenceCursor(transcript_id), 77, missing_timecode)
+        self.assertEqual(missing_timecode_rejected.exception.status_code, 422)
 
     def test_legacy_evidence_without_identity_remains_reviewable(self):
         cursor = LegacyEvidenceCursor()

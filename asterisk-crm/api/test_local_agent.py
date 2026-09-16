@@ -124,6 +124,24 @@ class LocalAgentIngressTests(unittest.TestCase):
         call_update = next(params for sql, params in fake_pool.connection_value.cursor_value.executed if "UPDATE calls SET transcript" in sql)
         self.assertEqual(call_update[1], "ready")
 
+    def test_timeless_segment_pair_is_accepted_and_persisted_verbatim(self):
+        segment = payload().segments[0].model_dump()
+        segment.update({"started_ms": None, "ended_ms": None})
+        timeless = payload(segments=[segment])
+        self.assertIsNone(timeless.segments[0].started_ms)
+        self.assertIsNone(timeless.segments[0].ended_ms)
+
+        fake_pool = Pool()
+        with patch.object(app, "fetch_one", side_effect=[{"id": 8}, None]), patch.object(app, "pool", fake_pool):
+            result = app.ingest_local_agent_transcript(timeless, "t" * 32)
+        self.assertFalse(result["idempotent"])
+        inserted = next(
+            params
+            for sql, params in fake_pool.connection_value.cursor_value.executed
+            if "INSERT INTO transcript_segments" in sql
+        )
+        self.assertEqual(inserted[0][2:4], (None, None))
+
     def test_analysis_queue_requires_explicit_enablement(self):
         fake_pool = Pool()
         with (
@@ -178,6 +196,18 @@ class LocalAgentIngressTests(unittest.TestCase):
             ])
         with self.assertRaises(ValidationError):
             payload(audio_duration_sec=40)
+
+    def test_contract_rejects_partial_timecode_pair(self):
+        base = payload().segments[0].model_dump()
+        for started_ms, ended_ms in ((None, 42_000), (0, None)):
+            with self.subTest(started_ms=started_ms, ended_ms=ended_ms), self.assertRaises(ValidationError):
+                payload(segments=[{**base, "started_ms": started_ms, "ended_ms": ended_ms}])
+
+    def test_contract_rejects_mixed_timed_and_timeless_segments(self):
+        timed = payload().segments[0].model_dump()
+        timeless = {**timed, "ordinal": 1, "started_ms": None, "ended_ms": None}
+        with self.assertRaises(ValidationError):
+            payload(segments=[timed, timeless])
 
 
 if __name__ == "__main__":

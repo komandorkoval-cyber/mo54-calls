@@ -37,7 +37,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
-PROMPT_VERSION = "sales-v1.3-segment-evidence"
+PROMPT_VERSION = "sales-v1.4-timeless-evidence"
 MODEL_NAME = {"gigachat": GIGACHAT_MODEL, "openai": OPENAI_MODEL, "ollama": OLLAMA_MODEL}.get(LLM_PROVIDER, LLM_PROVIDER)
 _token, _token_expiry = "", 0.0
 
@@ -77,8 +77,8 @@ def _field_proposal_schema(value_schema: dict) -> dict:
                 "required": ["segment_ordinal", "segment_start_ms", "segment_end_ms", "quote"],
                 "properties": {
                     "segment_ordinal": {"type": "integer", "minimum": 0},
-                    "segment_start_ms": {"type": "integer", "minimum": 0},
-                    "segment_end_ms": {"type": "integer", "minimum": 0},
+                    "segment_start_ms": {"type": ["integer", "null"], "minimum": 0},
+                    "segment_end_ms": {"type": ["integer", "null"], "minimum": 0},
                     "quote": {"type": "string", "minLength": 1, "maxLength": 400},
                 },
             }},
@@ -132,8 +132,8 @@ INSIGHT_SCHEMA = {
                 "properties": {
                     "field": {"type": "string"},
                     "segment_ordinal": {"type": "integer", "minimum": 0},
-                    "segment_start_ms": {"type": "integer", "minimum": 0},
-                    "segment_end_ms": {"type": "integer", "minimum": 0},
+                    "segment_start_ms": {"type": ["integer", "null"], "minimum": 0},
+                    "segment_end_ms": {"type": ["integer", "null"], "minimum": 0},
                     "quote": {"type": "string", "minLength": 1, "maxLength": 400},
                 },
             },
@@ -185,7 +185,10 @@ Treat no other text as input. Every evidence item, including every
 `segment_start_ms`, `segment_end_ms`, and `quote`. All four values must identify
 one and only one input segment: ordinal and both timestamps must be exact, and
 quote must be an exact, case-sensitive substring of that same segment's text.
-Never combine neighbouring segments or cite a flattened transcript.
+Some manually reviewed segments intentionally have no audio timecode and use
+`started_ms: null` together with `ended_ms: null`. When citing such a segment,
+copy that exact null pair. Never use only one null, invent a timestamp, combine
+neighbouring segments, or cite a flattened transcript.
 """.strip()
 SYSTEM_PROMPT = f"{SYSTEM_PROMPT}\n\n{EVIDENCE_REQUIREMENTS}\n\n{TIMELINE_ONLY_REQUIREMENTS}"
 
@@ -212,12 +215,28 @@ def _timeline_segments(segments: list[dict]) -> list[dict]:
         role = segment.get("speaker") or segment.get("role") or "unknown"
         if role not in {"customer", "manager", "unknown"}:
             role = "unknown"
+        if "started_ms" not in segment or "ended_ms" not in segment:
+            raise LLMError("Transcript segment timecode pair is missing")
+        started = segment["started_ms"]
+        ended = segment["ended_ms"]
+        if started is None or ended is None:
+            if started is not None or ended is not None:
+                raise LLMError("Transcript segment timecode must be a pair of nulls or integers")
+        elif (
+            not isinstance(started, int)
+            or isinstance(started, bool)
+            or not isinstance(ended, int)
+            or isinstance(ended, bool)
+            or started < 0
+            or ended <= started
+        ):
+            raise LLMError("Transcript segment timecode is invalid")
         timeline.append(
             {
                 "ordinal": ordinal,
                 "role": role,
-                "started_ms": segment.get("started_ms"),
-                "ended_ms": segment.get("ended_ms"),
+                "started_ms": started,
+                "ended_ms": ended,
                 "text": text,
             }
         )
@@ -266,34 +285,39 @@ def _validate_commercial_proposal(data: dict) -> None:
 def _validate_evidence_references(data: dict, segments: list[dict]) -> None:
     """Require every model citation to point to one exact persisted segment."""
 
-    source_by_identity: dict[tuple[int, int, int], str] = {}
+    source_by_identity: dict[tuple[int, int | None, int | None], str] = {}
     for segment in _timeline_segments(segments):
         ordinal = segment["ordinal"]
         started = segment["started_ms"]
         ended = segment["ended_ms"]
-        if (
-            isinstance(started, int)
-            and not isinstance(started, bool)
-            and isinstance(ended, int)
-            and not isinstance(ended, bool)
-            and started >= 0
-            and ended > started
-        ):
-            identity = (ordinal, started, ended)
-            if identity in source_by_identity:
-                # This must be impossible for persisted rows because the
-                # database has UNIQUE(transcript_id, ordinal).  Treat a
-                # malformed caller as untrusted instead of accepting an
-                # ambiguous evidence reference.
-                raise LLMError("Transcript segment identity is not unique")
-            source_by_identity[identity] = segment["text"]
+        identity = (ordinal, started, ended)
+        if identity in source_by_identity:
+            # This must be impossible for persisted rows because the database
+            # has UNIQUE(transcript_id, ordinal).  Treat a malformed caller as
+            # untrusted instead of accepting an ambiguous evidence reference.
+            raise LLMError("Transcript segment identity is not unique")
+        source_by_identity[identity] = segment["text"]
 
     def validate(items: list[dict], context: str) -> None:
         for item in items:
+            started = item["segment_start_ms"]
+            ended = item["segment_end_ms"]
+            if started is None or ended is None:
+                if started is not None or ended is not None:
+                    raise LLMError(f"{context}: evidence timecode must be a pair of nulls or integers")
+            elif (
+                not isinstance(started, int)
+                or isinstance(started, bool)
+                or not isinstance(ended, int)
+                or isinstance(ended, bool)
+                or started < 0
+                or ended <= started
+            ):
+                raise LLMError(f"{context}: evidence timecode is invalid")
             identity = (
                 item["segment_ordinal"],
-                item["segment_start_ms"],
-                item["segment_end_ms"],
+                started,
+                ended,
             )
             source_text = source_by_identity.get(identity)
             if source_text is None:
