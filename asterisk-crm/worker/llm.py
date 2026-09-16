@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import time
@@ -37,7 +38,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
-PROMPT_VERSION = "sales-v1.5-complete-commercial-proposal"
+PROMPT_VERSION = "sales-v1.7-legacy-function-transport"
 MODEL_NAME = {"gigachat": GIGACHAT_MODEL, "openai": OPENAI_MODEL, "ollama": OLLAMA_MODEL}.get(LLM_PROVIDER, LLM_PROVIDER)
 _token, _token_expiry = "", 0.0
 
@@ -169,7 +170,74 @@ INSIGHT_SCHEMA = {
                                for name, schema in COMMERCIAL_FIELD_VALUE_SCHEMAS.items()}}}},
     },
 }
+
+
+# The current GigaChat legacy function endpoint accepts a deliberately small
+# JSON Schema dialect.  This is a transport contract, not the persistence
+# contract: every response is expanded and then checked against the complete
+# ``INSIGHT_SCHEMA`` locally before it can be stored.
+GIGACHAT_TRANSPORT_STRING_FIELDS = (
+    "summary",
+    "customer_intent",
+    "customer_need",
+    "product",
+    "timeline",
+    "decision_maker",
+    "lead_stage",
+    "lead_temperature",
+    "next_step",
+    "next_step_owner",
+    "loss_risk",
+    "outcome",
+)
+GIGACHAT_TRANSPORT_ARRAY_FIELDS = (
+    "objections",
+    "manager_responses",
+    "agreements",
+    "customer_promises",
+    "company_promises",
+    "recommendations",
+)
+GIGACHAT_TRANSPORT_EVIDENCE_FIELDS = ("field", "segment_ordinal", "quote")
+GIGACHAT_TRANSPORT_EVIDENCE_FIELD_SET = frozenset(GIGACHAT_TRANSPORT_EVIDENCE_FIELDS)
+GIGACHAT_TRANSPORT_REQUIRED_FIELDS = (
+    *GIGACHAT_TRANSPORT_STRING_FIELDS,
+    *GIGACHAT_TRANSPORT_ARRAY_FIELDS,
+    "confidence",
+    "evidence",
+    "commercial_proposal",
+)
+GIGACHAT_TRANSPORT_REQUIRED_FIELD_SET = frozenset(GIGACHAT_TRANSPORT_REQUIRED_FIELDS)
+GIGACHAT_LEGACY_INSIGHT_FUNCTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        **{name: {"type": "string"} for name in GIGACHAT_TRANSPORT_STRING_FIELDS},
+        **{
+            name: {"type": "array", "items": {"type": "string"}}
+            for name in GIGACHAT_TRANSPORT_ARRAY_FIELDS
+        },
+        "confidence": {"type": "number"},
+        "evidence": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string"},
+                    "segment_ordinal": {"type": "integer"},
+                    "quote": {"type": "string"},
+                },
+            },
+        },
+        # Empty properties are intentional: `{}` is a valid no-proposal
+        # result. The local commercial fallback expands it to safe unknowns.
+        "commercial_proposal": {"type": "object", "properties": {}},
+    },
+    "required": list(GIGACHAT_TRANSPORT_REQUIRED_FIELDS),
+}
+
+COMMERCIAL_PROPOSAL_SCHEMA = INSIGHT_SCHEMA["properties"]["commercial_proposal"]
 validator = Draft202012Validator(INSIGHT_SCHEMA)
+commercial_proposal_validator = Draft202012Validator(COMMERCIAL_PROPOSAL_SCHEMA)
 
 SYSTEM_PROMPT = f"""Ты — аналитик продаж небольшой компании. Анализируй только факты из транскрипта.
 Не выдумывай сведения: неизвестные скалярные значения указывай как null, списки — как [].
@@ -224,6 +292,25 @@ SYSTEM_PROMPT = (
     f"{SYSTEM_PROMPT}\n\n{EVIDENCE_REQUIREMENTS}\n\n{TIMELINE_ONLY_REQUIREMENTS}"
     f"\n\n{COMMERCIAL_PROPOSAL_COMPLETENESS_REQUIREMENTS}"
 )
+GIGACHAT_INSIGHT_FUNCTION_NAME = "submit_sales_insight"
+GIGACHAT_FUNCTION_COMMERCIAL_REQUIREMENTS = """
+For `commercial_proposal`, return `{}` unless you can supply a complete,
+evidence-backed fields object. Never emit a partial or uncertain commercial
+proposal: it must not create a reviewable business draft.
+""".strip()
+GIGACHAT_FUNCTION_SYSTEM_PROMPT = f"""You are a sales-call analyst. Treat the user JSON `segments` as the only source of facts.
+Return the result exclusively by calling `{GIGACHAT_INSIGHT_FUNCTION_NAME}`; do not write an
+answer in `content`. Supply every required transport key and add no extra keys.
+
+In this function contract, an exactly empty string means unknown for every string field. Do not
+use null for those fields and do not use numeric 0 to mean unknown. Use [] for an unknown list.
+`confidence` must be a real number from 0 to 1.
+
+Each `evidence` item must contain only `field`, `segment_ordinal`, and `quote`. The ordinal must
+identify one input segment exactly, and quote must be an exact case-sensitive substring of that
+same segment's text. Do not send timestamps: the server copies the stored timecode pair itself.
+
+{GIGACHAT_FUNCTION_COMMERCIAL_REQUIREMENTS}"""
 
 
 class LLMError(RuntimeError):
@@ -364,25 +451,40 @@ def _validate_evidence_references(data: dict, segments: list[dict]) -> None:
         validate(proposal["evidence"], name)
 
 
-def _normalize_empty_commercial_proposal(data: object) -> None:
-    """Convert only a wholly omitted commercial fields container to unknowns.
+def _is_complete_commercial_proposal(proposal: object) -> bool:
+    """Return whether a proposal is safe to retain exactly as supplied.
 
-    Some providers occasionally return an otherwise complete insight with
-    ``commercial_proposal: {}`` (or with ``fields: {}``) when no commercial
-    fact is supported.  That means no field can become actionable, so the
-    only safe recovery is to make every field explicitly ``unknown``.  A
-    missing top-level proposal, a partial fields object, a null/list value, or
-    any unexpected property remains subject to the strict schema and is
-    rejected below.
+    This intentionally checks both JSON shape and the additional guardrails
+    that make a commercial value actionable.  Evidence identity is validated
+    separately against the stored transcript after the top-level insight
+    schema passes; it is never silently repaired here.
+    """
+
+    if list(commercial_proposal_validator.iter_errors(proposal)):
+        return False
+    try:
+        _validate_commercial_proposal({"commercial_proposal": proposal})
+    except (LLMError, KeyError, TypeError):
+        return False
+    return True
+
+
+def _normalize_commercial_proposal(data: object) -> None:
+    """Fail closed when a provider returns an incomplete proposal object.
+
+    A malformed commercial proposal can contain a mix of valid-looking and
+    incomplete field values.  Retaining any subset would make unsupported
+    business changes look reviewable, so *any* missing, empty, partial, or
+    malformed proposal is replaced wholesale with explicit ``unknown``
+    fields.  The rest of the top-level insight is untouched: its schema and
+    all evidence references are still validated strictly below.
     """
 
     if not isinstance(data, dict):
         return
-    commercial = data.get("commercial_proposal")
-    if not isinstance(commercial, dict):
+    if _is_complete_commercial_proposal(data.get("commercial_proposal")):
         return
-    if "fields" not in commercial or commercial["fields"] == {}:
-        commercial["fields"] = _unknown_commercial_fields()
+    data["commercial_proposal"] = {"fields": _unknown_commercial_fields()}
 
 
 def _parse(raw: str, *, segments: list[dict] | None = None) -> dict:
@@ -394,7 +496,7 @@ def _parse(raw: str, *, segments: list[dict] | None = None) -> dict:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
         raise LLMError(f"Invalid JSON: {exc}") from exc
-    _normalize_empty_commercial_proposal(data)
+    _normalize_commercial_proposal(data)
     errors = sorted(validator.iter_errors(data), key=lambda e: list(e.path))
     if errors:
         details = "; ".join(f"{'.'.join(map(str, e.path)) or '$'}: {e.message}" for e in errors[:8])
@@ -432,6 +534,152 @@ def _require_local_browser_agent_gigachat(source_kind: str) -> None:
         raise LLMError("local_browser_agent analysis requires GIGACHAT_AUTH_KEY")
 
 
+def _extract_gigachat_function_arguments(response_body: object) -> dict:
+    """Extract one forced legacy GigaChat function-call payload fail closed."""
+
+    if not isinstance(response_body, dict):
+        raise LLMError("GigaChat response must be an object")
+    choices = response_body.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise LLMError("GigaChat response has no valid choice")
+    choice = choices[0]
+    if choice.get("finish_reason") != "function_call":
+        raise LLMError("GigaChat must finish with function_call")
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise LLMError("GigaChat function-call message is missing")
+    function_call = message.get("function_call")
+    if not isinstance(function_call, dict):
+        raise LLMError("GigaChat function_call is missing")
+    if function_call.get("name") != GIGACHAT_INSIGHT_FUNCTION_NAME:
+        raise LLMError("GigaChat returned an unexpected function name")
+
+    arguments = function_call.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError as exc:
+            raise LLMError("GigaChat function_call arguments are not valid JSON") from exc
+    if not isinstance(arguments, dict):
+        raise LLMError("GigaChat function_call arguments must be a JSON object")
+    return arguments
+
+
+def _validate_gigachat_transport_arguments(arguments: object) -> dict:
+    """Require the exact compact function-call contract before expansion."""
+
+    if not isinstance(arguments, dict):
+        raise LLMError("GigaChat transport arguments must be a JSON object")
+    if not all(isinstance(name, str) for name in arguments):
+        raise LLMError("GigaChat transport argument names must be strings")
+    actual_fields = frozenset(arguments)
+    missing = GIGACHAT_TRANSPORT_REQUIRED_FIELD_SET - actual_fields
+    extra = actual_fields - GIGACHAT_TRANSPORT_REQUIRED_FIELD_SET
+    if missing:
+        raise LLMError(f"GigaChat transport arguments are missing fields: {', '.join(sorted(missing))}")
+    if extra:
+        raise LLMError(f"GigaChat transport arguments contain unexpected fields: {', '.join(sorted(extra))}")
+
+    for name in GIGACHAT_TRANSPORT_STRING_FIELDS:
+        if not isinstance(arguments[name], str):
+            raise LLMError(f"GigaChat transport {name} must be a string")
+    for name in GIGACHAT_TRANSPORT_ARRAY_FIELDS:
+        value = arguments[name]
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise LLMError(f"GigaChat transport {name} must be an array of strings")
+
+    confidence = arguments["confidence"]
+    if (
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or confidence < 0
+        or confidence > 1
+        or (isinstance(confidence, float) and not math.isfinite(confidence))
+    ):
+        raise LLMError("GigaChat transport confidence must be a finite number from 0 to 1")
+
+    evidence = arguments["evidence"]
+    if not isinstance(evidence, list):
+        raise LLMError("GigaChat transport evidence must be an array")
+    for index, item in enumerate(evidence):
+        if not isinstance(item, dict):
+            raise LLMError(f"GigaChat transport evidence[{index}] must be an object")
+        if not all(isinstance(name, str) for name in item):
+            raise LLMError(f"GigaChat transport evidence[{index}] field names must be strings")
+        item_fields = frozenset(item)
+        if item_fields != GIGACHAT_TRANSPORT_EVIDENCE_FIELD_SET:
+            missing_item = GIGACHAT_TRANSPORT_EVIDENCE_FIELD_SET - item_fields
+            extra_item = item_fields - GIGACHAT_TRANSPORT_EVIDENCE_FIELD_SET
+            details = []
+            if missing_item:
+                details.append(f"missing {', '.join(sorted(missing_item))}")
+            if extra_item:
+                details.append(f"unexpected {', '.join(sorted(extra_item))}")
+            raise LLMError(f"GigaChat transport evidence[{index}] has invalid fields: {'; '.join(details)}")
+        if not isinstance(item["field"], str):
+            raise LLMError(f"GigaChat transport evidence[{index}].field must be a string")
+        ordinal = item["segment_ordinal"]
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 0:
+            raise LLMError(f"GigaChat transport evidence[{index}].segment_ordinal must be a non-negative integer")
+        quote = item["quote"]
+        if not isinstance(quote, str) or not quote or len(quote) > 400:
+            raise LLMError(f"GigaChat transport evidence[{index}].quote must be a non-empty string up to 400 chars")
+
+    if not isinstance(arguments["commercial_proposal"], dict):
+        raise LLMError("GigaChat transport commercial_proposal must be an object")
+    return arguments
+
+
+def _canonicalize_gigachat_transport_arguments(arguments: object, segments: list[dict]) -> dict:
+    """Expand safe transport arguments into the complete persisted insight.
+
+    GigaChat never supplies timecodes in its legacy function contract.  The
+    worker derives them solely from the referenced stored ordinal, including a
+    deliberate ``null/null`` pair for timeless reviewed segments.
+    """
+
+    arguments = _validate_gigachat_transport_arguments(arguments)
+    source_by_ordinal: dict[int, dict] = {}
+    for segment in _timeline_segments(segments):
+        ordinal = segment["ordinal"]
+        if ordinal in source_by_ordinal:
+            raise LLMError("Transcript segment ordinal is not unique")
+        source_by_ordinal[ordinal] = segment
+
+    evidence = []
+    for item in arguments["evidence"]:
+        source = source_by_ordinal.get(item["segment_ordinal"])
+        if source is None:
+            raise LLMError("GigaChat transport evidence ordinal does not match a transcript segment")
+        evidence.append({
+            "field": item["field"],
+            "segment_ordinal": item["segment_ordinal"],
+            "segment_start_ms": source["started_ms"],
+            "segment_end_ms": source["ended_ms"],
+            "quote": item["quote"],
+        })
+
+    result = {
+        name: None if arguments[name] == "" else arguments[name]
+        for name in GIGACHAT_TRANSPORT_STRING_FIELDS
+    }
+    result.update({
+        "budget_amount": None,
+        "next_step_date": None,
+        "quality_scores": {
+            "discovery": None,
+            "clarity": None,
+            "objection_handling": None,
+            "next_step": None,
+        },
+        "evidence": evidence,
+        "confidence": arguments["confidence"],
+        "commercial_proposal": arguments["commercial_proposal"],
+    })
+    result.update({name: list(arguments[name]) for name in GIGACHAT_TRANSPORT_ARRAY_FIELDS})
+    return result
+
+
 def summarize(transcript: str, segments: list[dict], *, source_kind: str = "legacy") -> dict:
     """Generate one validated insight.
 
@@ -447,13 +695,28 @@ def summarize(transcript: str, segments: list[dict], *, source_kind: str = "lega
             response = httpx.post(
                 "https://gigachat.devices.sberbank.ru/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {_gigachat_token()}"},
-                json={"model": GIGACHAT_MODEL, "max_tokens": 1800,
-                      "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                                   {"role": "user", "content": analysis_input}]},
+                json={
+                    "model": GIGACHAT_MODEL,
+                    "max_tokens": 1800,
+                    "functions": [{
+                        "name": GIGACHAT_INSIGHT_FUNCTION_NAME,
+                        "description": "Submit one complete evidence-backed sales-call insight.",
+                        "parameters": GIGACHAT_LEGACY_INSIGHT_FUNCTION_SCHEMA,
+                    }],
+                    "function_call": {"name": GIGACHAT_INSIGHT_FUNCTION_NAME},
+                    "messages": [
+                        {"role": "system", "content": GIGACHAT_FUNCTION_SYSTEM_PROMPT},
+                        {"role": "user", "content": analysis_input},
+                    ],
+                },
                 verify=GIGACHAT_CA_BUNDLE, timeout=90,
             )
             response.raise_for_status()
-            raw = response.json()["choices"][0]["message"]["content"]
+            transport_arguments = _extract_gigachat_function_arguments(response.json())
+            raw = json.dumps(
+                _canonicalize_gigachat_transport_arguments(transport_arguments, segments),
+                ensure_ascii=False,
+            )
         elif LLM_PROVIDER == "openai":
             response = httpx.post(
                 "https://api.openai.com/v1/chat/completions",

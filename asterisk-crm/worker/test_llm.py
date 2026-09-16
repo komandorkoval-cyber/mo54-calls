@@ -2,7 +2,18 @@ import json
 import unittest
 from unittest.mock import patch
 
-from llm import LLMError, _parse, build_analysis_input, summarize
+from llm import (
+    GIGACHAT_LEGACY_INSIGHT_FUNCTION_SCHEMA,
+    GIGACHAT_INSIGHT_FUNCTION_NAME,
+    GIGACHAT_TRANSPORT_REQUIRED_FIELDS,
+    INSIGHT_SCHEMA,
+    LLMError,
+    _canonicalize_gigachat_transport_arguments,
+    _extract_gigachat_function_arguments,
+    _parse,
+    build_analysis_input,
+    summarize,
+)
 
 
 def unknown(value=None):
@@ -45,6 +56,54 @@ VALID = {
     "commercial_proposal": commercial_fields(),
 }
 
+TRANSPORT_VALID = {
+    "summary": "Customer requested a quote.",
+    "customer_intent": "Receive a proposal",
+    "customer_need": "Price calculation",
+    "product": "",
+    "timeline": "",
+    "decision_maker": "",
+    "lead_stage": "qualified",
+    "lead_temperature": "warm",
+    "next_step": "Prepare a quote",
+    "next_step_owner": "manager",
+    "loss_risk": "low",
+    "outcome": "proposal_needed",
+    "objections": [],
+    "manager_responses": [],
+    "agreements": ["Send a quote"],
+    "customer_promises": [],
+    "company_promises": ["Send a quote"],
+    "recommendations": ["Clarify budget"],
+    "confidence": 0.87,
+    "evidence": [{
+        "field": "next_step",
+        "segment_ordinal": 0,
+        "quote": "I will send a quote today",
+    }],
+    "commercial_proposal": {},
+}
+
+
+def gigachat_function_response(arguments, *, finish_reason="function_call",
+                               name=GIGACHAT_INSIGHT_FUNCTION_NAME):
+    return {
+        "choices": [{
+            "finish_reason": finish_reason,
+            "message": {"function_call": {"name": name, "arguments": arguments}},
+        }],
+    }
+
+
+def contains_list_valued_type(schema):
+    if isinstance(schema, dict):
+        if isinstance(schema.get("type"), list):
+            return True
+        return any(contains_list_valued_type(value) for value in schema.values())
+    if isinstance(schema, list):
+        return any(contains_list_valued_type(value) for value in schema)
+    return False
+
 
 class InsightValidationTest(unittest.TestCase):
     def test_accepts_valid_payload_with_exact_timeline_evidence(self):
@@ -79,54 +138,7 @@ class InsightValidationTest(unittest.TestCase):
         with self.assertRaises(LLMError):
             _parse(json.dumps(invalid), segments=SEGMENTS)
 
-    def test_normalizes_omitted_commercial_fields_to_explicit_unknowns(self):
-        valid = json.loads(json.dumps(VALID))
-        valid["commercial_proposal"] = {}
-
-        parsed = _parse(json.dumps(valid), segments=SEGMENTS)
-
-        self.assertEqual(parsed["commercial_proposal"], commercial_fields())
-
-    def test_normalizes_empty_commercial_fields_to_explicit_unknowns(self):
-        valid = json.loads(json.dumps(VALID))
-        valid["commercial_proposal"] = {"fields": {}}
-
-        parsed = _parse(json.dumps(valid), segments=SEGMENTS)
-
-        self.assertEqual(parsed["commercial_proposal"], commercial_fields())
-
-    def test_rejects_partial_commercial_fields_instead_of_filling_gaps(self):
-        invalid = json.loads(json.dumps(VALID))
-        invalid["commercial_proposal"] = {"fields": {"pain_primary": unknown()}}
-
-        with self.assertRaises(LLMError):
-            _parse(json.dumps(invalid), segments=SEGMENTS)
-
-    def test_rejects_missing_commercial_proposal_instead_of_creating_one(self):
-        invalid = json.loads(json.dumps(VALID))
-        invalid.pop("commercial_proposal")
-
-        with self.assertRaises(LLMError):
-            _parse(json.dumps(invalid), segments=SEGMENTS)
-
-    def test_rejects_unexpected_commercial_proposal_property_after_normalization(self):
-        invalid = json.loads(json.dumps(VALID))
-        invalid["commercial_proposal"] = {"unexpected": True}
-
-        with self.assertRaises(LLMError):
-            _parse(json.dumps(invalid), segments=SEGMENTS)
-
-    def test_rejects_unexpected_field(self):
-        with self.assertRaises(LLMError):
-            _parse(json.dumps({**VALID, "invented": True}), segments=SEGMENTS)
-
-    def test_rejects_unsupported_budget_instead_of_inventing_a_fact(self):
-        invalid = json.loads(json.dumps(VALID))
-        invalid["commercial_proposal"]["fields"]["estimated_budget_min"]["proposed_value"] = 120000
-        with self.assertRaises(LLMError):
-            _parse(json.dumps(invalid), segments=SEGMENTS)
-
-    def test_accepts_supported_field_with_exact_segment_evidence(self):
+    def test_preserves_a_complete_evidence_backed_commercial_proposal(self):
         valid = json.loads(json.dumps(VALID))
         valid["commercial_proposal"]["fields"]["pain_primary"] = {
             "proposed_value": "Need rain protection", "confidence": 0.91,
@@ -137,10 +149,62 @@ class InsightValidationTest(unittest.TestCase):
             }],
             "inference_status": "supported",
         }
-        self.assertEqual(
-            _parse(json.dumps(valid), segments=SEGMENTS)["commercial_proposal"]["fields"]["pain_primary"]["confidence"],
-            0.91,
-        )
+
+        parsed = _parse(json.dumps(valid), segments=SEGMENTS)
+
+        self.assertEqual(parsed["commercial_proposal"], valid["commercial_proposal"])
+
+    def test_discards_missing_empty_partial_or_malformed_commercial_proposal(self):
+        cases = {
+            "missing": lambda value: value.pop("commercial_proposal"),
+            "empty": lambda value: value.update({"commercial_proposal": {}}),
+            "partial": lambda value: value.update({"commercial_proposal": {
+                "fields": {"pain_primary": unknown()},
+            }}),
+            "malformed": lambda value: value.update({"commercial_proposal": {
+                "unexpected": True,
+            }}),
+            "wrong_type": lambda value: value.update({"commercial_proposal": []}),
+        }
+        for label, break_proposal in cases.items():
+            with self.subTest(label=label):
+                invalid = json.loads(json.dumps(VALID))
+                # A valid-looking actionable value must not survive a partial
+                # or malformed envelope.
+                invalid["commercial_proposal"]["fields"]["pain_primary"] = {
+                    "proposed_value": "Need rain protection", "confidence": 0.91,
+                    "evidence": [{
+                        "segment_ordinal": 0,
+                        "segment_start_ms": 1200, "segment_end_ms": 3800,
+                        "quote": "Need rain protection",
+                    }],
+                    "inference_status": "supported",
+                }
+                break_proposal(invalid)
+
+                parsed = _parse(json.dumps(invalid), segments=SEGMENTS)
+
+                self.assertEqual(parsed["commercial_proposal"], commercial_fields())
+
+    def test_rejects_invalid_top_level_evidence_after_commercial_recovery(self):
+        invalid = json.loads(json.dumps(VALID))
+        invalid["commercial_proposal"] = {"fields": {"pain_primary": unknown()}}
+        invalid["evidence"][0]["quote"] = "invented fact"
+
+        with self.assertRaisesRegex(LLMError, "exact transcript substring"):
+            _parse(json.dumps(invalid), segments=SEGMENTS)
+
+    def test_rejects_unexpected_field(self):
+        with self.assertRaises(LLMError):
+            _parse(json.dumps({**VALID, "invented": True}), segments=SEGMENTS)
+
+    def test_discards_a_semantically_invalid_commercial_value(self):
+        invalid = json.loads(json.dumps(VALID))
+        invalid["commercial_proposal"]["fields"]["estimated_budget_min"]["proposed_value"] = 120000
+
+        parsed = _parse(json.dumps(invalid), segments=SEGMENTS)
+
+        self.assertEqual(parsed["commercial_proposal"], commercial_fields())
 
     def test_rejects_evidence_for_an_interval_that_is_not_stored(self):
         invalid = json.loads(json.dumps(VALID))
@@ -216,6 +280,139 @@ class InsightValidationTest(unittest.TestCase):
         self.assertEqual(body["segments"][0]["role"], "customer")
         self.assertEqual(body["segments"][0]["started_ms"], 1200)
 
+    def test_gigachat_forces_one_insight_function_and_accepts_object_arguments(self):
+        captured = {}
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return gigachat_function_response(TRANSPORT_VALID)
+
+        def post(_url, **kwargs):
+            captured.update(kwargs)
+            return Response()
+
+        with patch("llm.LLM_PROVIDER", "gigachat"), patch("llm.GIGACHAT_AUTH_KEY", "configured"), \
+                patch("llm._gigachat_token", return_value="token"), patch("llm.httpx.post", side_effect=post):
+            result = summarize("canonical transcript", SEGMENTS)
+
+        self.assertEqual(result["summary"], VALID["summary"])
+        self.assertIsNone(result["product"])
+        self.assertIsNone(result["budget_amount"])
+        self.assertIsNone(result["next_step_date"])
+        self.assertEqual(result["quality_scores"], {
+            "discovery": None, "clarity": None,
+            "objection_handling": None, "next_step": None,
+        })
+        self.assertEqual(result["evidence"][0]["segment_start_ms"], 1200)
+        self.assertEqual(result["evidence"][0]["segment_end_ms"], 3800)
+        self.assertEqual(result["commercial_proposal"], commercial_fields())
+        request = captured["json"]
+        self.assertEqual(request["function_call"], {"name": GIGACHAT_INSIGHT_FUNCTION_NAME})
+        self.assertEqual(len(request["functions"]), 1)
+        self.assertEqual(request["functions"][0]["name"], GIGACHAT_INSIGHT_FUNCTION_NAME)
+        parameters = request["functions"][0]["parameters"]
+        self.assertEqual(parameters, GIGACHAT_LEGACY_INSIGHT_FUNCTION_SCHEMA)
+        self.assertNotEqual(parameters, INSIGHT_SCHEMA)
+        self.assertFalse(contains_list_valued_type(parameters))
+        self.assertEqual(parameters["required"], list(GIGACHAT_TRANSPORT_REQUIRED_FIELDS))
+        self.assertEqual(set(parameters["properties"]), set(GIGACHAT_TRANSPORT_REQUIRED_FIELDS))
+        self.assertEqual(parameters["properties"]["summary"], {"type": "string"})
+        self.assertEqual(parameters["properties"]["confidence"], {"type": "number"})
+        self.assertEqual(parameters["properties"]["evidence"], {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string"},
+                    "segment_ordinal": {"type": "integer"},
+                    "quote": {"type": "string"},
+                },
+            },
+        })
+        self.assertEqual(parameters["properties"]["commercial_proposal"], {
+            "type": "object", "properties": {},
+        })
+        self.assertNotIn("budget_amount", parameters["properties"])
+        self.assertNotIn("next_step_date", parameters["properties"])
+        self.assertNotIn("quality_scores", parameters["properties"])
+        self.assertNotIn("response_format", request)
+        payload = json.loads(request["messages"][1]["content"])
+        self.assertEqual(set(payload), {"segments"})
+
+    def test_gigachat_normalizes_string_function_arguments(self):
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return gigachat_function_response(json.dumps(TRANSPORT_VALID))
+
+        with patch("llm.LLM_PROVIDER", "gigachat"), patch("llm.GIGACHAT_AUTH_KEY", "configured"), \
+                patch("llm._gigachat_token", return_value="token"), patch("llm.httpx.post", return_value=Response()):
+            result = summarize("canonical transcript", SEGMENTS)
+
+        self.assertEqual(result["summary"], VALID["summary"])
+
+    def test_gigachat_transport_canonicalizes_timeless_evidence(self):
+        timeless = [{
+            **SEGMENTS[0],
+            "started_ms": None,
+            "ended_ms": None,
+        }]
+
+        canonical = _canonicalize_gigachat_transport_arguments(TRANSPORT_VALID, timeless)
+        parsed = _parse(json.dumps(canonical), segments=timeless)
+
+        self.assertEqual(parsed["evidence"][0]["segment_ordinal"], 0)
+        self.assertIsNone(parsed["evidence"][0]["segment_start_ms"])
+        self.assertIsNone(parsed["evidence"][0]["segment_end_ms"])
+        self.assertEqual(parsed["quality_scores"], {
+            "discovery": None, "clarity": None,
+            "objection_handling": None, "next_step": None,
+        })
+
+    def test_gigachat_transport_rejects_extra_missing_or_bad_arguments(self):
+        cases = {
+            "missing": lambda value: value.pop("summary"),
+            "extra": lambda value: value.update({"budget_amount": 100000}),
+            "bad_string": lambda value: value.update({"summary": None}),
+            "bad_confidence": lambda value: value.update({"confidence": "0.87"}),
+            "bad_evidence": lambda value: value["evidence"][0].update({"segment_start_ms": 1200}),
+            "bad_commercial": lambda value: value.update({"commercial_proposal": []}),
+        }
+        for label, break_transport in cases.items():
+            with self.subTest(label=label):
+                invalid = json.loads(json.dumps(TRANSPORT_VALID))
+                break_transport(invalid)
+                with self.assertRaisesRegex(LLMError, "GigaChat transport"):
+                    _canonicalize_gigachat_transport_arguments(invalid, SEGMENTS)
+
+    def test_gigachat_transport_rejects_nonliteral_evidence_after_time_enrichment(self):
+        invalid = json.loads(json.dumps(TRANSPORT_VALID))
+        invalid["evidence"][0]["quote"] = "invented fact"
+
+        canonical = _canonicalize_gigachat_transport_arguments(invalid, SEGMENTS)
+
+        self.assertEqual(canonical["evidence"][0]["segment_start_ms"], 1200)
+        self.assertEqual(canonical["evidence"][0]["segment_end_ms"], 3800)
+        with self.assertRaisesRegex(LLMError, "exact transcript substring"):
+            _parse(json.dumps(canonical), segments=SEGMENTS)
+
+    def test_gigachat_rejects_wrong_finish_name_or_arguments(self):
+        cases = {
+            "finish": (gigachat_function_response(TRANSPORT_VALID, finish_reason="stop"), "finish with function_call"),
+            "name": (gigachat_function_response(TRANSPORT_VALID, name="unexpected"), "unexpected function name"),
+            "not_object": (gigachat_function_response([]), "arguments must be a JSON object"),
+            "not_json": (gigachat_function_response("not-json"), "arguments are not valid JSON"),
+        }
+        for label, (body, message) in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(LLMError, message):
+                    _extract_gigachat_function_arguments(body)
+
     def test_local_browser_agent_refuses_openai_before_any_http_request(self):
         with patch("llm.LLM_PROVIDER", "openai"), patch("llm.GIGACHAT_AUTH_KEY", "configured"), \
                 patch("llm.httpx.post") as post:
@@ -238,7 +435,7 @@ class InsightValidationTest(unittest.TestCase):
                 return None
 
             def json(self):
-                return {"choices": [{"message": {"content": json.dumps(VALID)}}]}
+                return gigachat_function_response(TRANSPORT_VALID)
 
         def post(_url, **kwargs):
             captured.update(kwargs)
