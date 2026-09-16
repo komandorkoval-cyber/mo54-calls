@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,6 +28,20 @@ class AgentRunner:
         free_gib = usage.free / 1024**3
         free_percent = usage.free * 100 / usage.total
         return free_gib >= self.config.minimum_free_gib and free_percent >= self.config.minimum_free_percent
+
+    @staticmethod
+    def duration_within_inventory_tolerance(inventory_duration_sec: int | None, audio_duration_sec: int | None) -> bool:
+        """Allow normal call-setup/teardown time, but reject a wrong recording.
+
+        Novofon call duration can include connection events that are absent
+        from the saved conversation.  A difference above the larger of 15
+        seconds and 15% is treated as a manual-review blocker before CRM
+        delivery, not silently accepted.
+        """
+        if inventory_duration_sec is None or audio_duration_sec is None:
+            return True
+        allowed_delta = max(15, math.ceil(inventory_duration_sec * 0.15))
+        return abs(inventory_duration_sec - audio_duration_sec) <= allowed_delta
 
     def purge_audio(self) -> bool:
         """Delete only audio whose transcript delivery to CRM was confirmed."""

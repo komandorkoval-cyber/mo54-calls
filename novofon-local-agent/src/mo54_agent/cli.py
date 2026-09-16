@@ -20,6 +20,56 @@ from .security import set_crm_token
 from .store import AgentLock, AgentStore
 
 
+def _apply_manual_pilot_roles(
+    transcript_path: Path,
+    *,
+    manager_labels: set[str],
+    customer_labels: set[str],
+) -> dict[str, int]:
+    """Apply an operator-confirmed role map without printing transcript text."""
+    if not manager_labels and not customer_labels:
+        raise AgentError("manual_roles_missing", "Choose at least one local speaker label", retryable=False)
+    overlap = manager_labels & customer_labels
+    if overlap:
+        raise AgentError("manual_roles_conflict", "One speaker cannot be both manager and customer", retryable=False)
+
+    raw = json.loads(transcript_path.read_text(encoding="utf-8"))
+    segments = raw.get("segments")
+    if not isinstance(segments, list) or not segments:
+        raise AgentError("pilot_transcript_invalid", "The local pilot transcript has no segments", retryable=False)
+    labels = {
+        str(segment.get("speaker_label") or "").strip()
+        for segment in segments
+        if str(segment.get("speaker_label") or "").strip()
+    }
+    requested = manager_labels | customer_labels
+    if not requested <= labels:
+        raise AgentError("manual_role_label_unknown", "A selected speaker label is not present in the local transcript", retryable=False)
+
+    counts = {"manager": 0, "customer": 0}
+    for segment in segments:
+        label = str(segment.get("speaker_label") or "").strip()
+        if label in manager_labels:
+            segment["role"] = "manager"
+            counts["manager"] += 1
+        elif label in customer_labels:
+            segment["role"] = "customer"
+            counts["customer"] += 1
+
+    # The audit note stays in the local JSON. The text-only CRM contract sees
+    # only the explicit segment roles after operator confirmation.
+    raw["manual_role_assignment"] = {
+        "method": "operator_confirmation",
+        "assigned_at": datetime.now(timezone.utc).isoformat(),
+        "manager_labels": sorted(manager_labels),
+        "customer_labels": sorted(customer_labels),
+    }
+    temporary = transcript_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(transcript_path)
+    return counts
+
+
 def _components() -> tuple[AgentPaths, AgentConfig, AgentStore]:
     paths = AgentPaths.default()
     paths.ensure()
@@ -61,6 +111,10 @@ def main(argv: list[str] | None = None) -> None:
     download_pilot.add_argument("call_session_id")
     transcribe_pilot = subcommands.add_parser("transcribe-pilot")
     transcribe_pilot.add_argument("call_session_id")
+    assign_roles = subcommands.add_parser("assign-pilot-roles")
+    assign_roles.add_argument("call_session_id")
+    assign_roles.add_argument("--manager-label", action="append", default=[])
+    assign_roles.add_argument("--customer-label", action="append", default=[])
     deliver_pilot = subcommands.add_parser("deliver-pilot")
     deliver_pilot.add_argument("call_session_id")
     subcommands.add_parser("exclude-pending-downloads")
@@ -103,7 +157,10 @@ def main(argv: list[str] | None = None) -> None:
                 print(json.dumps(AgentRunner(paths, config, store).run_once(), ensure_ascii=False))
         elif args.command == "download-pilot":
             with AgentLock(paths.lock):
-                audio = AgentRunner(paths, config, store).download_pilot(args.call_session_id)
+                runner = AgentRunner(paths, config, store)
+                audio = runner.download_pilot(args.call_session_id)
+                record = store.get(args.call_session_id)
+                inventory_duration = record.duration_sec if record else None
                 # This local-only receipt provides the acceptance metadata
                 # without printing an audio path, browser data, or transcript.
                 print(json.dumps({
@@ -111,6 +168,9 @@ def main(argv: list[str] | None = None) -> None:
                     "call_session_id": args.call_session_id,
                     "audio_sha256": audio.sha256,
                     "audio_duration_sec": audio.duration_sec,
+                    "inventory_duration_sec": inventory_duration,
+                    "duration_delta_sec": abs(inventory_duration - audio.duration_sec) if inventory_duration is not None else None,
+                    "duration_within_tolerance": runner.duration_within_inventory_tolerance(inventory_duration, audio.duration_sec),
                 }, ensure_ascii=False))
         elif args.command == "transcribe-pilot":
             with AgentLock(paths.lock):
@@ -131,6 +191,11 @@ def main(argv: list[str] | None = None) -> None:
                     print(json.dumps({
                         "transcribed": 1,
                         "call_session_id": args.call_session_id,
+                        "audio_sha256": record.audio_sha256,
+                        "audio_duration_sec": record.audio_duration_sec,
+                        "inventory_duration_sec": record.duration_sec,
+                        "duration_delta_sec": abs(record.duration_sec - record.audio_duration_sec) if record.duration_sec is not None and record.audio_duration_sec is not None else None,
+                        "duration_within_tolerance": runner.duration_within_inventory_tolerance(record.duration_sec, record.audio_duration_sec),
                         "segments": len(transcript.segments),
                         "roles": roles,
                         "language": transcript.language,
@@ -140,6 +205,22 @@ def main(argv: list[str] | None = None) -> None:
                 except AgentError as exc:
                     store.mark_error(record.call_session_id, exc.code, asr=True)
                     raise
+        elif args.command == "assign-pilot-roles":
+            with AgentLock(paths.lock):
+                record = store.get(args.call_session_id)
+                if not record or record.status != "transcribed" or not record.transcript_path:
+                    raise AgentError("pilot_call_not_reviewable", "The selected pilot call is not ready for local role review", retryable=False)
+                counts = _apply_manual_pilot_roles(
+                    record.transcript_path,
+                    manager_labels={label.strip() for label in args.manager_label if label.strip()},
+                    customer_labels={label.strip() for label in args.customer_label if label.strip()},
+                )
+                print(json.dumps({
+                    "call_session_id": args.call_session_id,
+                    "manual_roles_applied": True,
+                    "assigned_segments": counts,
+                    "crm_contacted": False,
+                }, ensure_ascii=False))
         elif args.command == "deliver-pilot":
             with AgentLock(paths.lock):
                 record = store.get(args.call_session_id)
@@ -147,6 +228,8 @@ def main(argv: list[str] | None = None) -> None:
                     raise AgentError("pilot_call_not_deliverable", "The selected pilot call is not ready for CRM delivery", retryable=False)
                 if not record.audio_sha256 or not record.audio_duration_sec or not record.transcript_path:
                     raise AgentError("pilot_transcript_missing", "The pilot transcript metadata is incomplete", retryable=False)
+                if not AgentRunner.duration_within_inventory_tolerance(record.duration_sec, record.audio_duration_sec):
+                    raise AgentError("pilot_duration_mismatch", "Downloaded audio duration needs manual review before CRM delivery", retryable=False)
                 transcript = Transcript.from_path(record.transcript_path)
                 # CRMClient receives the metadata object only.  Its path is never
                 # opened or uploaded; the endpoint contract contains text only.

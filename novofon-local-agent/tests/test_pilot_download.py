@@ -53,6 +53,10 @@ class PilotDownloadTests(unittest.TestCase):
                 self.runner.download_pilot("missing-1")
         self.assertEqual(caught.exception.code, "pilot_call_not_in_inventory")
 
+    def test_duration_tolerance_allows_connection_overhead_but_not_a_wrong_recording(self) -> None:
+        self.assertTrue(self.runner.duration_within_inventory_tolerance(203, 189))
+        self.assertFalse(self.runner.duration_within_inventory_tolerance(203, 150))
+
 
 if __name__ == "__main__":
     unittest.main()
