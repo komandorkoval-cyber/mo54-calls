@@ -79,6 +79,43 @@ class InsightValidationTest(unittest.TestCase):
         with self.assertRaises(LLMError):
             _parse(json.dumps(invalid), segments=SEGMENTS)
 
+    def test_normalizes_omitted_commercial_fields_to_explicit_unknowns(self):
+        valid = json.loads(json.dumps(VALID))
+        valid["commercial_proposal"] = {}
+
+        parsed = _parse(json.dumps(valid), segments=SEGMENTS)
+
+        self.assertEqual(parsed["commercial_proposal"], commercial_fields())
+
+    def test_normalizes_empty_commercial_fields_to_explicit_unknowns(self):
+        valid = json.loads(json.dumps(VALID))
+        valid["commercial_proposal"] = {"fields": {}}
+
+        parsed = _parse(json.dumps(valid), segments=SEGMENTS)
+
+        self.assertEqual(parsed["commercial_proposal"], commercial_fields())
+
+    def test_rejects_partial_commercial_fields_instead_of_filling_gaps(self):
+        invalid = json.loads(json.dumps(VALID))
+        invalid["commercial_proposal"] = {"fields": {"pain_primary": unknown()}}
+
+        with self.assertRaises(LLMError):
+            _parse(json.dumps(invalid), segments=SEGMENTS)
+
+    def test_rejects_missing_commercial_proposal_instead_of_creating_one(self):
+        invalid = json.loads(json.dumps(VALID))
+        invalid.pop("commercial_proposal")
+
+        with self.assertRaises(LLMError):
+            _parse(json.dumps(invalid), segments=SEGMENTS)
+
+    def test_rejects_unexpected_commercial_proposal_property_after_normalization(self):
+        invalid = json.loads(json.dumps(VALID))
+        invalid["commercial_proposal"] = {"unexpected": True}
+
+        with self.assertRaises(LLMError):
+            _parse(json.dumps(invalid), segments=SEGMENTS)
+
     def test_rejects_unexpected_field(self):
         with self.assertRaises(LLMError):
             _parse(json.dumps({**VALID, "invented": True}), segments=SEGMENTS)

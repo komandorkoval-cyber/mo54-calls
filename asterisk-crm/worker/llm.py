@@ -37,7 +37,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
-PROMPT_VERSION = "sales-v1.4-timeless-evidence"
+PROMPT_VERSION = "sales-v1.5-complete-commercial-proposal"
 MODEL_NAME = {"gigachat": GIGACHAT_MODEL, "openai": OPENAI_MODEL, "ollama": OLLAMA_MODEL}.get(LLM_PROVIDER, LLM_PROVIDER)
 _token, _token_expiry = "", 0.0
 
@@ -63,6 +63,28 @@ COMMERCIAL_FIELD_VALUE_SCHEMAS = {
         "disqualified", None,
     ]},
 }
+
+
+def _unknown_commercial_field(value_schema: dict) -> dict:
+    """Return a schema-valid, deliberately non-actionable field proposal."""
+
+    # Arrays must stay arrays to satisfy the schema.  Every other commercial
+    # value schema accepts null, which means "the transcript does not support
+    # a value" without inventing one.
+    value = [] if value_schema.get("type") == "array" else None
+    return {
+        "proposed_value": value,
+        "confidence": None,
+        "evidence": [],
+        "inference_status": "unknown",
+    }
+
+
+def _unknown_commercial_fields() -> dict:
+    return {
+        name: _unknown_commercial_field(value_schema)
+        for name, value_schema in COMMERCIAL_FIELD_VALUE_SCHEMAS.items()
+    }
 
 
 def _field_proposal_schema(value_schema: dict) -> dict:
@@ -190,7 +212,18 @@ Some manually reviewed segments intentionally have no audio timecode and use
 copy that exact null pair. Never use only one null, invent a timestamp, combine
 neighbouring segments, or cite a flattened transcript.
 """.strip()
-SYSTEM_PROMPT = f"{SYSTEM_PROMPT}\n\n{EVIDENCE_REQUIREMENTS}\n\n{TIMELINE_ONLY_REQUIREMENTS}"
+COMMERCIAL_PROPOSAL_COMPLETENESS_REQUIREMENTS = f"""
+Always include `commercial_proposal` with a `fields` object containing every
+one of these keys: {", ".join(COMMERCIAL_FIELD_VALUE_SCHEMAS)}. Do not omit an
+unknown field. For an unknown scalar use exactly `proposed_value: null`,
+`confidence: null`, `evidence: []`, and `inference_status: "unknown"`. For the
+array fields `pain_secondary` and `decision_makers`, use `proposed_value: []`
+instead. An unknown field must not contain evidence.
+""".strip()
+SYSTEM_PROMPT = (
+    f"{SYSTEM_PROMPT}\n\n{EVIDENCE_REQUIREMENTS}\n\n{TIMELINE_ONLY_REQUIREMENTS}"
+    f"\n\n{COMMERCIAL_PROPOSAL_COMPLETENESS_REQUIREMENTS}"
+)
 
 
 class LLMError(RuntimeError):
@@ -331,6 +364,27 @@ def _validate_evidence_references(data: dict, segments: list[dict]) -> None:
         validate(proposal["evidence"], name)
 
 
+def _normalize_empty_commercial_proposal(data: object) -> None:
+    """Convert only a wholly omitted commercial fields container to unknowns.
+
+    Some providers occasionally return an otherwise complete insight with
+    ``commercial_proposal: {}`` (or with ``fields: {}``) when no commercial
+    fact is supported.  That means no field can become actionable, so the
+    only safe recovery is to make every field explicitly ``unknown``.  A
+    missing top-level proposal, a partial fields object, a null/list value, or
+    any unexpected property remains subject to the strict schema and is
+    rejected below.
+    """
+
+    if not isinstance(data, dict):
+        return
+    commercial = data.get("commercial_proposal")
+    if not isinstance(commercial, dict):
+        return
+    if "fields" not in commercial or commercial["fields"] == {}:
+        commercial["fields"] = _unknown_commercial_fields()
+
+
 def _parse(raw: str, *, segments: list[dict] | None = None) -> dict:
     text = raw.strip()
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL)
@@ -340,6 +394,7 @@ def _parse(raw: str, *, segments: list[dict] | None = None) -> dict:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
         raise LLMError(f"Invalid JSON: {exc}") from exc
+    _normalize_empty_commercial_proposal(data)
     errors = sorted(validator.iter_errors(data), key=lambda e: list(e.path))
     if errors:
         details = "; ".join(f"{'.'.join(map(str, e.path)) or '$'}: {e.message}" for e in errors[:8])
