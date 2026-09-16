@@ -47,8 +47,20 @@ def process(job: dict) -> None:
             transcript = latest_transcript(job["call_id"])
             if not transcript:
                 raise ValueError("Transcript is missing")
-            insight = summarize(transcript["text"])
-            save_insight(job["call_id"], insight, MODEL_NAME, PROMPT_VERSION)
+            source_kind = transcript.get("source_kind") or "legacy"
+            insight = summarize(
+                transcript["text"],
+                transcript["segments"],
+                source_kind=source_kind,
+            )
+            save_insight(
+                job["call_id"],
+                insight,
+                MODEL_NAME,
+                PROMPT_VERSION,
+                source_kind=source_kind,
+                transcript_id=transcript["id"],
+            )
         else:
             raise ValueError(f"Unsupported job kind: {job['kind']}")
         complete_job(job["id"], int((time.monotonic() - started) * 1000))

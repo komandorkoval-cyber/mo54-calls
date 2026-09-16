@@ -15,6 +15,7 @@ from .browser import NovofonBrowser
 from .config import AgentConfig, AgentPaths
 from .crm import CRMClient
 from .errors import AgentError
+from .review import load_approved_review, preserve_automatic_baseline, review_pilot
 from .runner import AgentRunner
 from .security import set_crm_token
 from .store import AgentLock, AgentStore
@@ -33,6 +34,9 @@ def _apply_manual_pilot_roles(
     if overlap:
         raise AgentError("manual_roles_conflict", "One speaker cannot be both manager and customer", retryable=False)
 
+    # Keep raw ASR output separately before an operator annotation changes the
+    # working transcript.  The review artifact later hashes that source.
+    preserve_automatic_baseline(transcript_path)
     raw = json.loads(transcript_path.read_text(encoding="utf-8"))
     segments = raw.get("segments")
     if not isinstance(segments, list) or not segments:
@@ -115,6 +119,8 @@ def main(argv: list[str] | None = None) -> None:
     assign_roles.add_argument("call_session_id")
     assign_roles.add_argument("--manager-label", action="append", default=[])
     assign_roles.add_argument("--customer-label", action="append", default=[])
+    review_pilot_command = subcommands.add_parser("review-pilot")
+    review_pilot_command.add_argument("call_session_id")
     deliver_pilot = subcommands.add_parser("deliver-pilot")
     deliver_pilot.add_argument("call_session_id")
     subcommands.add_parser("exclude-pending-downloads")
@@ -221,26 +227,56 @@ def main(argv: list[str] | None = None) -> None:
                     "assigned_segments": counts,
                     "crm_contacted": False,
                 }, ensure_ascii=False))
-        elif args.command == "deliver-pilot":
+        elif args.command == "review-pilot":
             with AgentLock(paths.lock):
                 record = store.get(args.call_session_id)
                 if not record or record.status != "transcribed":
+                    raise AgentError("pilot_call_not_reviewable", "The selected pilot call is not ready for local review", retryable=False)
+                artifact = review_pilot(
+                    paths,
+                    record,
+                    on_started=lambda url: print(json.dumps({
+                        "call_session_id": args.call_session_id,
+                        "review_url": url,
+                        "bound_to_loopback": True,
+                        "crm_contacted": False,
+                    }, ensure_ascii=False), flush=True),
+                )
+                print(json.dumps({
+                    "call_session_id": args.call_session_id,
+                    "review_approved": True,
+                    "review_artifact": artifact.name,
+                    "crm_contacted": False,
+                }, ensure_ascii=False))
+        elif args.command == "deliver-pilot":
+            with AgentLock(paths.lock):
+                record = store.get(args.call_session_id)
+                if not record:
+                    raise AgentError("pilot_call_not_deliverable", "The selected pilot call is not ready for CRM delivery", retryable=False)
+                if record.status == "sent":
+                    # The first confirmed delivery makes this approved review
+                    # immutable.  A local rerun therefore cannot create a
+                    # hidden second transcript version.
+                    load_approved_review(paths, record)
+                    print(json.dumps({"delivered": 0, "already_delivered": True}, ensure_ascii=False))
+                    return
+                if record.status != "transcribed":
                     raise AgentError("pilot_call_not_deliverable", "The selected pilot call is not ready for CRM delivery", retryable=False)
                 if not record.audio_sha256 or not record.audio_duration_sec or not record.transcript_path:
                     raise AgentError("pilot_transcript_missing", "The pilot transcript metadata is incomplete", retryable=False)
                 if not AgentRunner.duration_within_inventory_tolerance(record.duration_sec, record.audio_duration_sec):
                     raise AgentError("pilot_duration_mismatch", "Downloaded audio duration needs manual review before CRM delivery", retryable=False)
-                transcript = Transcript.from_path(record.transcript_path)
+                transcript = load_approved_review(paths, record)
                 # CRMClient receives the metadata object only.  Its path is never
                 # opened or uploaded; the endpoint contract contains text only.
                 from .browser import DownloadedAudio
-                CRMClient(config).send_transcript(
+                response = CRMClient(config).send_transcript(
                     record.call_session_id,
                     DownloadedAudio(record.audio_path or paths.audio / "local-only", record.audio_sha256, record.audio_duration_sec),
                     transcript,
                 )
                 store.mark_sent(record.call_session_id)
-                print(json.dumps({"delivered": 1}, ensure_ascii=False))
+                print(json.dumps({"delivered": 1, "crm_idempotent": bool(response.get("idempotent"))}, ensure_ascii=False))
         elif args.command == "exclude-pending-downloads":
             with AgentLock(paths.lock):
                 print(json.dumps({"excluded": store.block_pending_downloads("excluded_before_schedule")}, ensure_ascii=False))

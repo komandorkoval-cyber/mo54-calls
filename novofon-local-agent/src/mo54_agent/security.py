@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import json
+import secrets
 import sys
 from ctypes import POINTER, Structure, byref, c_bool, c_byte, c_uint32, c_void_p, c_wchar_p, cast, windll
 from pathlib import Path
@@ -12,6 +13,10 @@ from .errors import AgentError
 
 KEYRING_SERVICE = "MO54CallsAgent"
 CRM_TOKEN_ACCOUNT = "crm-transcript-token"
+# This is deliberately separate from the server credential.  It authenticates
+# a local operator-approved review before that review can be delivered.
+REVIEW_SEAL_ACCOUNT = "review-artifact-seal-v1"
+REVIEW_SEAL_KEY_BYTES = 32
 
 
 def set_crm_token(token: str) -> None:
@@ -37,6 +42,80 @@ def get_crm_token() -> str:
     if not token:
         raise AgentError("crm_token_missing", "CRM token is missing from Windows Credential Manager", retryable=False)
     return token
+
+
+def _review_seal_key(*, create: bool) -> bytes:
+    """Load a local-only HMAC key from Windows Credential Manager.
+
+    The approved review file is intentionally readable JSON for an operator,
+    so a plain SHA-256 digest cannot establish immutability: an editor could
+    recompute it.  A separate Credential Manager secret provides an integrity
+    boundary without ever sending the key to CRM or storing it beside audio.
+    """
+
+    if sys.platform != "win32":
+        raise AgentError(
+            "pilot_review_seal_unavailable",
+            "Approved review sealing requires Windows Credential Manager",
+            retryable=False,
+        )
+    try:
+        import keyring
+        encoded = keyring.get_password(KEYRING_SERVICE, REVIEW_SEAL_ACCOUNT)
+    except Exception as exc:
+        raise AgentError(
+            "pilot_review_seal_unavailable",
+            "Windows Credential Manager review seal is unavailable",
+            retryable=False,
+        ) from exc
+    if encoded:
+        try:
+            key = base64.urlsafe_b64decode(encoded.encode("ascii"))
+        except (UnicodeEncodeError, ValueError) as exc:
+            raise AgentError(
+                "pilot_review_seal_invalid",
+                "The local review seal is unreadable",
+                retryable=False,
+            ) from exc
+        if len(key) != REVIEW_SEAL_KEY_BYTES:
+            raise AgentError(
+                "pilot_review_seal_invalid",
+                "The local review seal has an invalid length",
+                retryable=False,
+            )
+        return key
+    if not create:
+        raise AgentError(
+            "pilot_review_seal_missing",
+            "The local review seal is missing; delivery is blocked",
+            retryable=False,
+        )
+    key = secrets.token_bytes(REVIEW_SEAL_KEY_BYTES)
+    try:
+        keyring.set_password(
+            KEYRING_SERVICE,
+            REVIEW_SEAL_ACCOUNT,
+            base64.urlsafe_b64encode(key).decode("ascii"),
+        )
+    except Exception as exc:
+        raise AgentError(
+            "pilot_review_seal_unavailable",
+            "Windows Credential Manager cannot store the local review seal",
+            retryable=False,
+        ) from exc
+    return key
+
+
+def get_or_create_review_seal_key() -> bytes:
+    """Create the local review integrity key only while approving a review."""
+
+    return _review_seal_key(create=True)
+
+
+def get_review_seal_key() -> bytes:
+    """Load, but never silently replace, the key required for delivery."""
+
+    return _review_seal_key(create=False)
 
 
 if sys.platform == "win32":

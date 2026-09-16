@@ -13,6 +13,7 @@ from .config import AgentConfig, AgentPaths
 from .crm import CRMClient
 from .errors import AgentError
 from .observability import notify, prevent_sleep, safe_logger
+from .review import load_approved_review
 from .store import AgentStore
 
 
@@ -171,12 +172,20 @@ class AgentRunner:
             if not record.audio_sha256 or not record.audio_duration_sec or not record.transcript_path:
                 continue
             try:
-                transcript = Transcript.from_path(record.transcript_path)
+                # The current pilot has no configuration escape hatch.  An
+                # unattended task may never turn an unapproved ASR draft into
+                # a CRM delivery.
+                transcript = load_approved_review(self.paths, record)
                 metadata_path = record.audio_path or self.paths.audio / "retained-locally-no-longer-present"
                 client.send_transcript(record.call_session_id, DownloadedAudio(metadata_path, record.audio_sha256, record.audio_duration_sec), transcript)
                 self.store.mark_sent(record.call_session_id)
                 delivered += 1
             except AgentError as exc:
+                if exc.code.startswith("pilot_review_"):
+                    # Waiting for a human review is expected, not a failed
+                    # delivery and not a reason to notify the user every run.
+                    self.log.info("crm_delivery_deferred code=%s", exc.code)
+                    continue
                 # Keep status=transcribed so that delivery can be retried; never redo ASR/download.
                 self.store.event(exc.code)
                 self.log.warning("crm_delivery_failed code=%s", exc.code)

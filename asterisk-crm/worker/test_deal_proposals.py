@@ -30,6 +30,7 @@ def insight_with_supported_pain():
         "evidence": [{"segment_start_ms": 1200, "segment_end_ms": 3800, "quote": "Нам нужна защита от дождя"}],
         "inference_status": "supported",
     }
+    fields["pain_primary"]["evidence"][0]["segment_ordinal"] = 0
     return {"commercial_proposal": {"fields": fields}}
 
 
@@ -61,7 +62,22 @@ class DealUpdateProposalTests(unittest.TestCase):
         self.assertEqual(payload["base_values"]["pain_primary"], "Старое значение")
         self.assertEqual(payload["proposed_fields"]["pain_primary"]["proposed_value"], "Нужна защита от дождя")
         self.assertEqual(evidence[0]["segment_start_ms"], 1200)
+        self.assertNotIn("segment_ordinal", payload["proposed_fields"]["pain_primary"]["evidence"][0])
         self.assertEqual(len(cursor.executed), 1)
+
+    def test_local_agent_draft_evidence_carries_the_exact_transcript_identity(self):
+        deal_id = uuid4()
+        transcript_id = uuid4()
+        cursor = DealCursor([[self.snapshot(deal_id)]])
+        target = unambiguous_accessible_deal_for_call(cursor, 42)
+        payload, evidence = build_deal_update_payload(
+            insight_with_supported_pain(), target, transcript_id=transcript_id,
+        )
+        embedded = payload["proposed_fields"]["pain_primary"]["evidence"][0]
+        self.assertEqual(embedded["transcript_id"], str(transcript_id))
+        self.assertEqual(embedded["segment_ordinal"], 0)
+        self.assertEqual(evidence[0]["transcript_id"], str(transcript_id))
+        self.assertEqual(evidence[0]["segment_ordinal"], 0)
 
     def test_ambiguous_contact_relation_does_not_guess_a_target_deal(self):
         cursor = DealCursor([[], [self.snapshot(uuid4()), self.snapshot(uuid4())]])

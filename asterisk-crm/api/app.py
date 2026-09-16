@@ -504,6 +504,11 @@ class LocalAgentTranscript(BaseModel):
         actual = [segment.ordinal for segment in self.segments]
         if actual != expected:
             raise ValueError("segments must have contiguous ordinals starting at zero")
+        previous_end = 0
+        for segment in self.segments:
+            if segment.started_ms < previous_end:
+                raise ValueError("segment intervals must be ordered and non-overlapping")
+            previous_end = segment.ended_ms
         # Local ffprobe metadata is rounded to whole seconds.  Permit one
         # second of rounding slack while still rejecting a transcript attached
         # to materially different audio.
@@ -636,6 +641,10 @@ AI_DEAL_UPDATE_FIELDS = (
 )
 AI_DEAL_FIELD_BY_PROPOSAL = {"suggested_stage": "stage", **{field: field for field in AI_DEAL_UPDATE_FIELDS if field != "suggested_stage"}}
 AI_NUMERIC_FIELDS = frozenset({"estimated_budget_min", "estimated_budget_max"})
+# A v2 draft pins every citation to the immutable transcript revision and the
+# exact row that the model was shown.  Keep the marker separate from the
+# prompt version: it is an application/approval contract, not an LLM detail.
+AI_DEAL_UPDATE_EVIDENCE_V2_PREFIX = "p0-deal-update-v2"
 
 
 class TaskCreate(BaseModel):
@@ -1056,7 +1065,61 @@ def ai_deal_update_conflicts(current: dict[str, Any], values: dict[str, Any], ba
     return conflicts
 
 
-def validate_ai_evidence_links(cursor: Any, call_id: int, proposed_fields: dict[str, Any]) -> None:
+def _evidence_requires_exact_identity(
+    proposal_schema_version: Any, proposed_fields: dict[str, Any]
+) -> bool:
+    """Whether a stored deal draft must use the fail-closed v2 evidence path.
+
+    Old drafts predate transcript revision identities.  They remain reviewable
+    through the legacy path below, but no draft that claims to be v2 (or
+    already carries one half of an identity) may silently fall back to it.
+    """
+
+    if isinstance(proposal_schema_version, str) and proposal_schema_version.startswith(
+        AI_DEAL_UPDATE_EVIDENCE_V2_PREFIX
+    ):
+        return True
+    for field in AI_DEAL_UPDATE_FIELDS:
+        proposal = proposed_fields.get(field)
+        if not isinstance(proposal, dict):
+            continue
+        for evidence in proposal.get("evidence") or []:
+            if isinstance(evidence, dict) and (
+                "transcript_id" in evidence or "segment_ordinal" in evidence
+            ):
+                return True
+    return False
+
+
+def _strict_evidence_identity(evidence: Any, field: str) -> tuple[UUID, int, int, int, str]:
+    """Read one v2 citation without coercing unsafe stored JSON values."""
+
+    if not isinstance(evidence, dict):
+        raise HTTPException(422, f"Evidence для {field} имеет неверный формат")
+    try:
+        transcript_id = UUID(str(evidence["transcript_id"]))
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise HTTPException(422, f"Evidence для {field} не привязано к версии транскрипта") from exc
+
+    ordinal = evidence.get("segment_ordinal")
+    started = evidence.get("segment_start_ms")
+    ended = evidence.get("segment_end_ms")
+    if any(not isinstance(value, int) or isinstance(value, bool) for value in (ordinal, started, ended)):
+        raise HTTPException(422, f"Evidence для {field} имеет неверные границы сегмента")
+    if ordinal < 0 or started < 0 or ended <= started:
+        raise HTTPException(422, f"Evidence для {field} имеет неверные границы сегмента")
+    quote = evidence.get("quote")
+    if not isinstance(quote, str) or not quote:
+        raise HTTPException(422, f"Evidence для {field} не содержит точную цитату")
+    return transcript_id, ordinal, started, ended, quote
+
+
+def validate_ai_evidence_links(
+    cursor: Any,
+    call_id: int,
+    proposed_fields: dict[str, Any],
+    proposal_schema_version: Any = None,
+) -> None:
     """Reject a reviewable-looking proposal whose evidence is not in its call.
 
     The worker preserves model-provided offsets and quotes for review.  Approval
@@ -1064,11 +1127,37 @@ def validate_ai_evidence_links(cursor: Any, call_id: int, proposed_fields: dict[
     real transcript segment from the same call before it can change a deal.
     """
 
+    exact_identity_required = _evidence_requires_exact_identity(proposal_schema_version, proposed_fields)
     for field in AI_DEAL_UPDATE_FIELDS:
         proposal = proposed_fields.get(field) or {}
         if proposal.get("inference_status") == "unknown":
             continue
         for evidence in proposal.get("evidence") or []:
+            if exact_identity_required:
+                transcript_id, ordinal, started, ended, quote = _strict_evidence_identity(evidence, field)
+                cursor.execute(
+                    """SELECT s.text FROM transcript_segments s
+                       JOIN transcripts t ON t.id=s.transcript_id
+                       WHERE t.call_id=%s
+                         AND s.transcript_id=%s
+                         AND s.ordinal=%s
+                         AND s.started_ms=%s
+                         AND s.ended_ms=%s""",
+                    (call_id, transcript_id, ordinal, started, ended),
+                )
+                source_segment = cursor.fetchone()
+                # Case-sensitive containment is deliberate.  A quote from a
+                # different casing, a different segment, or another transcript
+                # revision must not become an approved business mutation.
+                if not source_segment or quote not in str(source_segment.get("text") or ""):
+                    raise HTTPException(422, f"Evidence для {field} не найдено в точном сегменте transcript")
+                continue
+
+            # Legacy v1 evidence did not persist transcript_id or ordinal.
+            # Preserve its existing approval behaviour for historical drafts;
+            # all new drafts are caught by the strict branch above.
+            if not isinstance(evidence, dict) or not evidence.get("quote"):
+                raise HTTPException(422, f"Evidence для {field} не привязано к сегменту")
             started = evidence.get("segment_start_ms")
             ended = evidence.get("segment_end_ms")
             cursor.execute(
@@ -1798,7 +1887,12 @@ def decide_action_draft(draft_id: UUID, body: ActionDraftDecision, user: User = 
             require_deal_access(target, user)
             payload["base_values"] = draft.get("base_deal_snapshot") or payload.get("base_values")
             values, proposed_fields, baseline = ai_deal_update_values(payload)
-            validate_ai_evidence_links(cur, draft["call_id"], proposed_fields)
+            validate_ai_evidence_links(
+                cur,
+                draft["call_id"],
+                proposed_fields,
+                draft.get("proposal_schema_version"),
+            )
             conflicts = ai_deal_update_conflicts(target, values, baseline)
             if conflicts:
                 raise HTTPException(409, {"detail": "AI draft устарел", "conflicts": conflicts})

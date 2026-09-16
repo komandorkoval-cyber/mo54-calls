@@ -172,6 +172,11 @@ class LocalAgentIngressTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             payload(segments=[{**payload().segments[0].model_dump(), "ordinal": 1}])
         with self.assertRaises(ValidationError):
+            payload(segments=[
+                {**payload().segments[0].model_dump(), "ordinal": 0, "started_ms": 0, "ended_ms": 21_000},
+                {**payload().segments[0].model_dump(), "ordinal": 1, "started_ms": 20_999, "ended_ms": 42_000},
+            ])
+        with self.assertRaises(ValidationError):
             payload(audio_duration_sec=40)
 
 

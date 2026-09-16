@@ -262,6 +262,7 @@ class DraftCursor:
         self.current = None
         self.deal_update_count = 0
         self.audit_count = 0
+        self.evidence_queries = []
 
     def execute(self, sql, params=()):
         if "FROM ai_action_drafts d" in sql:
@@ -287,7 +288,8 @@ class DraftCursor:
         elif "SELECT active FROM deal_reason_catalog" in sql:
             self.current = {"active": True}
         elif "FROM transcript_segments" in sql:
-            self.current = None
+            self.evidence_queries.append((sql, params))
+            self.current = {"text": "Нам нужна защита от дождя"} if "s.transcript_id=%s" in sql else None
         else:
             raise AssertionError(sql)
 
@@ -330,6 +332,118 @@ class DraftPool:
         return self.connection_value
 
 
+class ExactEvidenceCursor:
+    """Tiny DB double that only exposes one immutable transcript row."""
+
+    def __init__(self, transcript_id, ordinal=3, started_ms=100, ended_ms=900, text="Нам нужна защита от дождя"):
+        self.transcript_id = transcript_id
+        self.ordinal = ordinal
+        self.started_ms = started_ms
+        self.ended_ms = ended_ms
+        self.text = text
+        self.current = None
+        self.executed = []
+
+    def execute(self, sql, params=()):
+        self.executed.append((sql, params))
+        if "s.transcript_id=%s" not in sql:
+            raise AssertionError("v2 evidence must query an exact transcript segment")
+        _call_id, transcript_id, ordinal, started_ms, ended_ms = params
+        if (transcript_id, ordinal, started_ms, ended_ms) == (
+            self.transcript_id, self.ordinal, self.started_ms, self.ended_ms
+        ):
+            self.current = {"text": self.text}
+        else:
+            self.current = None
+
+    def fetchone(self):
+        return self.current
+
+
+class LegacyEvidenceCursor:
+    def __init__(self):
+        self.executed = []
+
+    def execute(self, sql, params=()):
+        self.executed.append((sql, params))
+
+    def fetchall(self):
+        return [{"text": "Нам нужна защита от дождя"}]
+
+
+class EvidenceIdentityTests(unittest.TestCase):
+    def v2_fields(self, source_transcript_id, **evidence_overrides):
+        fields = deal_update_payload()["proposed_fields"]
+        fields["pain_primary"]["evidence"] = [{
+            "transcript_id": str(source_transcript_id),
+            "segment_ordinal": 3,
+            "segment_start_ms": 100,
+            "segment_end_ms": 900,
+            "quote": "Нам нужна защита от дождя",
+            **evidence_overrides,
+        }]
+        return fields
+
+    def test_v2_evidence_matches_exact_transcript_row_and_case_sensitive_quote(self):
+        transcript_id = uuid4()
+        cursor = ExactEvidenceCursor(transcript_id)
+        app.validate_ai_evidence_links(
+            cursor,
+            77,
+            self.v2_fields(transcript_id),
+            "p0-deal-update-v2-evidence",
+        )
+        self.assertEqual(len(cursor.executed), 1)
+        self.assertEqual(cursor.executed[0][1][1:], (transcript_id, 3, 100, 900))
+
+        with self.assertRaises(HTTPException) as wrong_case:
+            app.validate_ai_evidence_links(
+                ExactEvidenceCursor(transcript_id),
+                77,
+                self.v2_fields(transcript_id, quote="нам нужна защита от дождя"),
+                "p0-deal-update-v2-evidence",
+            )
+        self.assertEqual(wrong_case.exception.status_code, 422)
+
+    def test_v2_evidence_rejects_another_transcript_version_and_any_non_exact_boundary(self):
+        transcript_id = uuid4()
+        for label, overrides in (
+            ("different transcript", {"transcript_id": str(uuid4())}),
+            ("different ordinal", {"segment_ordinal": 4}),
+            ("overlap only", {"segment_start_ms": 101}),
+            ("different end", {"segment_end_ms": 899}),
+        ):
+            with self.subTest(label=label), self.assertRaises(HTTPException) as rejected:
+                app.validate_ai_evidence_links(
+                    ExactEvidenceCursor(transcript_id),
+                    77,
+                    self.v2_fields(transcript_id, **overrides),
+                    "p0-deal-update-v2-evidence",
+                )
+            self.assertEqual(rejected.exception.status_code, 422)
+
+    def test_v2_fails_closed_when_identity_is_missing_or_partial(self):
+        transcript_id = uuid4()
+        missing = deal_update_payload()["proposed_fields"]
+        with self.assertRaises(HTTPException) as absent:
+            app.validate_ai_evidence_links(
+                ExactEvidenceCursor(transcript_id), 77, missing, "p0-deal-update-v2-evidence"
+            )
+        self.assertEqual(absent.exception.status_code, 422)
+
+        partial = self.v2_fields(transcript_id)
+        del partial["pain_primary"]["evidence"][0]["segment_ordinal"]
+        with self.assertRaises(HTTPException) as incomplete:
+            app.validate_ai_evidence_links(ExactEvidenceCursor(transcript_id), 77, partial)
+        self.assertEqual(incomplete.exception.status_code, 422)
+
+    def test_legacy_evidence_without_identity_remains_reviewable(self):
+        cursor = LegacyEvidenceCursor()
+        app.validate_ai_evidence_links(cursor, 77, deal_update_payload()["proposed_fields"], "p0-deal-update-v1")
+        self.assertEqual(len(cursor.executed), 1)
+        self.assertIn("s.ended_ms >=", cursor.executed[0][0])
+
+
 class DealUpdateDraftTests(unittest.TestCase):
     def setUp(self):
         self.user = app.User(id=uuid4(), email="owner@example.test", display_name="Owner", role="manager")
@@ -359,6 +473,26 @@ class DealUpdateDraftTests(unittest.TestCase):
         self.assertEqual(repeated.exception.status_code, 409)
         self.assertEqual(cursor.audit_count, 1)
         self.assertEqual(connection.commits, 1)
+
+    def test_v2_draft_is_checked_against_the_exact_transcript_identity_before_apply(self):
+        transcript_id = uuid4()
+        payload = deal_update_payload()
+        payload["proposed_fields"]["pain_primary"]["evidence"] = [{
+            "transcript_id": str(transcript_id),
+            "segment_ordinal": 3,
+            "segment_start_ms": 100,
+            "segment_end_ms": 900,
+            "quote": "Нам нужна защита от дождя",
+        }]
+        draft, target, cursor, connection = self.state(payload=payload)
+        draft["proposal_schema_version"] = "p0-deal-update-v2-evidence"
+        with patch.object(app, "pool", DraftPool(connection)):
+            app.decide_action_draft(self.draft_id, app.ActionDraftDecision(action="approve"), self.user)
+        self.assertEqual(target["pain_primary"], "Новая боль")
+        self.assertEqual(len(cursor.evidence_queries), 1)
+        sql, params = cursor.evidence_queries[0]
+        self.assertIn("s.transcript_id=%s", sql)
+        self.assertEqual(params, (77, transcript_id, 3, 100, 900))
 
     def test_stale_draft_does_not_overwrite_manager_change(self):
         _draft, target, cursor, connection = self.state(current_pain="Изменено менеджером")

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+from uuid import UUID
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -46,7 +47,77 @@ def _actionable(proposal: dict | None) -> bool:
     return value not in (None, [], "unknown")
 
 
-def build_deal_update_payload(insight: dict, deal_snapshot: dict) -> tuple[dict, list[dict]] | None:
+def _draft_transcript_id(transcript_id: object | None) -> str | None:
+    """Return a canonical transcript UUID for strict local-agent drafts."""
+
+    if transcript_id is None:
+        return None
+    try:
+        return str(UUID(str(transcript_id)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("local_browser_agent draft requires a valid transcript_id") from exc
+
+
+def _draft_evidence(item: object, transcript_id: str | None) -> dict:
+    """Copy one model citation into a draft without weakening its provenance.
+
+    Legacy drafts intentionally retain their v1 shape so historical approval
+    remains available.  Every local-agent draft is v2: its embedded proposal
+    evidence and its denormalized draft evidence both point to one immutable
+    transcript row and one exact timeline segment.
+    """
+
+    if not isinstance(item, dict):
+        raise ValueError("Draft evidence must be an object")
+    result = dict(item)
+    if transcript_id is None:
+        # Avoid accidentally classifying a legacy draft as v2 in the API
+        # merely because a new model schema contains the extra ordinal field.
+        result.pop("transcript_id", None)
+        result.pop("segment_ordinal", None)
+        return result
+
+    required = ("segment_ordinal", "segment_start_ms", "segment_end_ms", "quote")
+    if any(key not in result for key in required):
+        raise ValueError("local_browser_agent draft evidence is missing exact segment identity")
+    result["transcript_id"] = transcript_id
+    return result
+
+
+def _draft_fields(fields: dict, transcript_id: str | None) -> dict:
+    """Make a non-mutating draft-safe copy of commercial field proposals."""
+
+    prepared: dict = {}
+    for field, proposal in fields.items():
+        if not isinstance(proposal, dict):
+            prepared[field] = proposal
+            continue
+        copied = dict(proposal)
+        evidence = proposal.get("evidence", [])
+        if not isinstance(evidence, list):
+            raise ValueError(f"{field}: draft evidence must be an array")
+        copied["evidence"] = [_draft_evidence(item, transcript_id) for item in evidence]
+        prepared[field] = copied
+    return prepared
+
+
+def _denormalized_draft_evidence(fields: dict) -> list[dict]:
+    """Project per-field proposal citations for the draft list endpoint."""
+
+    return [
+        {**item, "field": field, "inference_status": proposal["inference_status"]}
+        for field, proposal in fields.items()
+        if isinstance(proposal, dict)
+        for item in proposal.get("evidence", [])
+    ]
+
+
+def build_deal_update_payload(
+    insight: dict,
+    deal_snapshot: dict,
+    *,
+    transcript_id: object | None = None,
+) -> tuple[dict, list[dict]] | None:
     """Build a reviewable, field-level proposal; never a business mutation."""
 
     fields = _commercial_fields(insight)
@@ -55,11 +126,9 @@ def build_deal_update_payload(insight: dict, deal_snapshot: dict) -> tuple[dict,
     normalized_fields = {field: fields[field] for field in AI_DEAL_UPDATE_FIELDS if field in fields}
     if len(normalized_fields) != len(AI_DEAL_UPDATE_FIELDS):
         return None
-    evidence = [
-        {"field": field, **item, "inference_status": proposal["inference_status"]}
-        for field, proposal in normalized_fields.items()
-        for item in proposal.get("evidence", [])
-    ]
+    draft_transcript_id = _draft_transcript_id(transcript_id)
+    normalized_fields = _draft_fields(normalized_fields, draft_transcript_id)
+    evidence = _denormalized_draft_evidence(normalized_fields)
     return ({
         "proposed_fields": _json_safe(normalized_fields),
         "base_values": _json_safe({field: deal_snapshot.get(field) for field in DEAL_SNAPSHOT_FIELDS}),
@@ -172,7 +241,21 @@ def latest_transcript(call_id: int) -> dict | None:
     with connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT * FROM transcripts WHERE call_id=%s ORDER BY version DESC LIMIT 1", (call_id,))
         row = cur.fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        transcript = dict(row)
+        # The LLM must see the original, ordered segment boundaries rather
+        # than infer them from a flattened transcript.  Evidence validation in
+        # llm.py uses this exact set of rows before an insight can be saved.
+        cur.execute(
+            """SELECT speaker, started_ms, ended_ms, text, ordinal
+               FROM transcript_segments
+               WHERE transcript_id=%s
+               ORDER BY ordinal""",
+            (transcript["id"],),
+        )
+        transcript["segments"] = [dict(segment) for segment in cur.fetchall()]
+        return transcript
 
 
 def save_transcript(call_id: int, text: str, segments: list[dict], model: str) -> None:
@@ -204,7 +287,27 @@ def save_transcript(call_id: int, text: str, segments: list[dict], model: str) -
         )
 
 
-def save_insight(call_id: int, insight: dict, model: str, prompt_version: str) -> None:
+def save_insight(
+    call_id: int,
+    insight: dict,
+    model: str,
+    prompt_version: str,
+    *,
+    source_kind: str = "legacy",
+    transcript_id: object | None = None,
+) -> None:
+    """Persist one insight and reviewable drafts.
+
+    A browser-agent transcript is user-reviewed local data.  Its worker path
+    may record an insight and action proposals, but must never overwrite call
+    business fields or its immutable transcript status.  Legacy Asterisk
+    analysis retains the original call projection update for compatibility.
+    """
+
+    is_local_browser_agent = source_kind == "local_browser_agent"
+    if is_local_browser_agent and transcript_id is None:
+        raise ValueError("local_browser_agent draft requires a valid transcript_id")
+    draft_transcript_id = _draft_transcript_id(transcript_id) if is_local_browser_agent else None
     with connection() as conn, conn.cursor() as cur:
         cur.execute("SELECT coalesce(max(version),0)+1 FROM call_insights WHERE call_id=%s", (call_id,))
         version = cur.fetchone()[0]
@@ -215,37 +318,47 @@ def save_insight(call_id: int, insight: dict, model: str, prompt_version: str) -
             (call_id, version, prompt_version, model, Json(insight), insight.get("confidence")),
         )
         insight_id = cur.fetchone()[0]
-        cur.execute(
-            """UPDATE calls SET theme=%s,client_request=%s,agreements=%s,amount=%s,
-               next_step=%s,next_date=%s,raw_json=%s,status='stored',
-               processing_status='ready',processing_error=NULL,updated_at=now() WHERE id=%s""",
-            (insight.get("summary"), insight.get("customer_need"),
-             json.dumps(insight.get("agreements"), ensure_ascii=False),
-             insight.get("budget_amount"), insight.get("next_step"),
-             insight.get("next_step_date"), Json(insight), call_id),
-        )
+        if is_local_browser_agent:
+            # Keep human-facing call fields exactly as the local-agent API
+            # stored them.  This is intentionally technical state only.
+            cur.execute(
+                """UPDATE calls SET processing_status='ready',processing_error=NULL,
+                   updated_at=now() WHERE id=%s""",
+                (call_id,),
+            )
+        else:
+            cur.execute(
+                """UPDATE calls SET theme=%s,client_request=%s,agreements=%s,amount=%s,
+                   next_step=%s,next_date=%s,raw_json=%s,status='stored',
+                   processing_status='ready',processing_error=NULL,updated_at=now() WHERE id=%s""",
+                (insight.get("summary"), insight.get("customer_need"),
+                 json.dumps(insight.get("agreements"), ensure_ascii=False),
+                 insight.get("budget_amount"), insight.get("next_step"),
+                 insight.get("next_step_date"), Json(insight), call_id),
+            )
         fields = _commercial_fields(insight)
         target_deal = unambiguous_accessible_deal_for_call(cur, call_id)
-        update_draft = build_deal_update_payload(insight, target_deal) if target_deal else None
+        update_draft = (
+            build_deal_update_payload(insight, target_deal, transcript_id=draft_transcript_id)
+            if target_deal else None
+        )
         if target_deal:
             if update_draft:
                 payload, evidence = update_draft
                 cur.execute(
                     """INSERT INTO ai_action_drafts(
                            call_id,insight_id,kind,target_deal_id,payload,evidence,base_deal_snapshot,proposal_schema_version
-                       ) VALUES(%s,%s,'deal_update',%s,%s,%s,%s,'p0-deal-update-v1')
+                       ) VALUES(%s,%s,'deal_update',%s,%s,%s,%s,%s)
                        ON CONFLICT(insight_id,kind) DO NOTHING""",
                     (call_id, insight_id, target_deal["id"], Json(payload), Json(evidence),
-                     Json(payload["base_values"])),
+                     Json(payload["base_values"]),
+                     "p0-deal-update-v2-evidence" if is_local_browser_agent else "p0-deal-update-v1"),
                 )
         elif insight.get("product") and any(_actionable(fields.get(field)) for field in AI_DEAL_UPDATE_FIELDS):
-            qualification = fields["qualification_segment"].get("proposed_value") if _actionable(fields.get("qualification_segment")) else "unknown"
-            suggested_stage = fields["suggested_stage"].get("proposed_value") if _actionable(fields.get("suggested_stage")) else "new_lead"
-            evidence = [
-                {"field": field, **item, "inference_status": proposal["inference_status"]}
-                for field, proposal in fields.items() if isinstance(proposal, dict)
-                for item in proposal.get("evidence", [])
-            ]
+            draft_fields = _draft_fields(fields, draft_transcript_id)
+            qualification = draft_fields["qualification_segment"].get("proposed_value") if _actionable(draft_fields.get("qualification_segment")) else "unknown"
+            suggested_stage = draft_fields["suggested_stage"].get("proposed_value") if _actionable(draft_fields.get("suggested_stage")) else "new_lead"
+            evidence = _denormalized_draft_evidence(draft_fields)
             cur.execute(
                 """INSERT INTO ai_action_drafts(call_id,insight_id,kind,payload,evidence)
                    VALUES(%s,%s,'deal_create',%s,%s) ON CONFLICT(insight_id,kind) DO NOTHING""",

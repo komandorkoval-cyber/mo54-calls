@@ -37,7 +37,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
-PROMPT_VERSION = "sales-v1.1"
+PROMPT_VERSION = "sales-v1.3-segment-evidence"
 MODEL_NAME = {"gigachat": GIGACHAT_MODEL, "openai": OPENAI_MODEL, "ollama": OLLAMA_MODEL}.get(LLM_PROVIDER, LLM_PROVIDER)
 _token, _token_expiry = "", 0.0
 
@@ -74,10 +74,11 @@ def _field_proposal_schema(value_schema: dict) -> dict:
             "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
             "evidence": {"type": "array", "items": {
                 "type": "object", "additionalProperties": False,
-                "required": ["segment_start_ms", "segment_end_ms", "quote"],
+                "required": ["segment_ordinal", "segment_start_ms", "segment_end_ms", "quote"],
                 "properties": {
-                    "segment_start_ms": {"type": ["integer", "null"], "minimum": 0},
-                    "segment_end_ms": {"type": ["integer", "null"], "minimum": 0},
+                    "segment_ordinal": {"type": "integer", "minimum": 0},
+                    "segment_start_ms": {"type": "integer", "minimum": 0},
+                    "segment_end_ms": {"type": "integer", "minimum": 0},
                     "quote": {"type": "string", "minLength": 1, "maxLength": 400},
                 },
             }},
@@ -126,8 +127,15 @@ INSIGHT_SCHEMA = {
         "evidence": {
             "type": "array",
             "items": {
-                "type": "object", "additionalProperties": False, "required": ["field", "quote"],
-                "properties": {"field": {"type": "string"}, "quote": {"type": "string", "maxLength": 400}},
+                "type": "object", "additionalProperties": False,
+                "required": ["field", "segment_ordinal", "segment_start_ms", "segment_end_ms", "quote"],
+                "properties": {
+                    "field": {"type": "string"},
+                    "segment_ordinal": {"type": "integer", "minimum": 0},
+                    "segment_start_ms": {"type": "integer", "minimum": 0},
+                    "segment_end_ms": {"type": "integer", "minimum": 0},
+                    "quote": {"type": "string", "minLength": 1, "maxLength": 400},
+                },
             },
         },
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
@@ -150,8 +158,86 @@ SYSTEM_PROMPT = f"""Ты — аналитик продаж небольшой к
 должны быть конкретными и относиться к следующему разговору."""
 
 
+EVIDENCE_REQUIREMENTS = """
+Сообщение пользователя — JSON с каноническим транскриптом и упорядоченным
+таймлайном `segments`. У каждой строки есть `role`, `started_ms`, `ended_ms` и
+`text`. Считай этот таймлайн единственным источником доказательств.
+
+Для каждого элемента верхнего массива `evidence` и каждого непустого массива
+`commercial_proposal.fields.*.evidence` значения `segment_start_ms` и
+`segment_end_ms` должны в точности совпадать с одной исходной строкой
+таймлайна. `quote` должна быть непустой дословной подстрокой поля `text` этой
+же строки: не перефразируй, не нормализуй, не объединяй строки и не ссылайся
+на соседний интервал. Если точную цитату дать нельзя, оставь соответствующее
+коммерческое поле неизвестным с пустым массивом evidence. Evidence не даёт
+права автоматически менять сделку, контакт или задачу: это только черновик
+для ручной проверки.
+""".strip()
+
+# Keep this compact English addendum alongside the Russian instruction above:
+# it is unambiguous for all supported providers and states the exact identity
+# contract enforced below.  The user payload deliberately contains no flattened
+# transcript, only the stored timeline rows.
+TIMELINE_ONLY_REQUIREMENTS = """
+The user payload contains only the persisted, ordered `segments` timeline.
+Treat no other text as input. Every evidence item, including every
+`commercial_proposal.fields.*.evidence` item, must contain `segment_ordinal`,
+`segment_start_ms`, `segment_end_ms`, and `quote`. All four values must identify
+one and only one input segment: ordinal and both timestamps must be exact, and
+quote must be an exact, case-sensitive substring of that same segment's text.
+Never combine neighbouring segments or cite a flattened transcript.
+""".strip()
+SYSTEM_PROMPT = f"{SYSTEM_PROMPT}\n\n{EVIDENCE_REQUIREMENTS}\n\n{TIMELINE_ONLY_REQUIREMENTS}"
+
+
 class LLMError(RuntimeError):
     pass
+
+
+def _timeline_segments(segments: list[dict]) -> list[dict]:
+    """Return a bounded, role-aware view of the stored transcript rows."""
+
+    if not isinstance(segments, list):
+        raise LLMError("Transcript segments must be a list")
+    timeline: list[dict] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            raise LLMError("Transcript segment must be an object")
+        text = segment.get("text")
+        if not isinstance(text, str) or not text:
+            raise LLMError("Transcript segment text is missing")
+        ordinal = segment.get("ordinal")
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 0:
+            raise LLMError("Transcript segment ordinal is missing or invalid")
+        role = segment.get("speaker") or segment.get("role") or "unknown"
+        if role not in {"customer", "manager", "unknown"}:
+            role = "unknown"
+        timeline.append(
+            {
+                "ordinal": ordinal,
+                "role": role,
+                "started_ms": segment.get("started_ms"),
+                "ended_ms": segment.get("ended_ms"),
+                "text": text,
+            }
+        )
+    return timeline
+
+
+def build_analysis_input(segments: list[dict]) -> str:
+    """Build the sole LLM payload from persisted timeline rows only.
+
+    ``transcripts.text`` is a convenience projection and can diverge from the
+    row-level timeline after review.  It is therefore intentionally absent: a
+    model may reason only over the immutable transcript_segments supplied by
+    ``latest_transcript``.
+    """
+
+    return json.dumps(
+        {"segments": _timeline_segments(segments)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def _validate_commercial_proposal(data: dict) -> None:
@@ -175,12 +261,53 @@ def _validate_commercial_proposal(data: dict) -> None:
             raise LLMError(f"{name}: supported/inferred field needs confidence")
         if not evidence:
             raise LLMError(f"{name}: supported/inferred field needs evidence")
-        for item in evidence:
-            if item["segment_start_ms"] is None and item["segment_end_ms"] is None:
-                raise LLMError(f"{name}: evidence must reference a transcript segment")
 
 
-def _parse(raw: str) -> dict:
+def _validate_evidence_references(data: dict, segments: list[dict]) -> None:
+    """Require every model citation to point to one exact persisted segment."""
+
+    source_by_identity: dict[tuple[int, int, int], str] = {}
+    for segment in _timeline_segments(segments):
+        ordinal = segment["ordinal"]
+        started = segment["started_ms"]
+        ended = segment["ended_ms"]
+        if (
+            isinstance(started, int)
+            and not isinstance(started, bool)
+            and isinstance(ended, int)
+            and not isinstance(ended, bool)
+            and started >= 0
+            and ended > started
+        ):
+            identity = (ordinal, started, ended)
+            if identity in source_by_identity:
+                # This must be impossible for persisted rows because the
+                # database has UNIQUE(transcript_id, ordinal).  Treat a
+                # malformed caller as untrusted instead of accepting an
+                # ambiguous evidence reference.
+                raise LLMError("Transcript segment identity is not unique")
+            source_by_identity[identity] = segment["text"]
+
+    def validate(items: list[dict], context: str) -> None:
+        for item in items:
+            identity = (
+                item["segment_ordinal"],
+                item["segment_start_ms"],
+                item["segment_end_ms"],
+            )
+            source_text = source_by_identity.get(identity)
+            if source_text is None:
+                raise LLMError(f"{context}: evidence identity does not match a transcript segment")
+            quote = item["quote"]
+            if quote not in source_text:
+                raise LLMError(f"{context}: evidence quote is not an exact transcript substring")
+
+    validate(data["evidence"], "evidence")
+    for name, proposal in data["commercial_proposal"]["fields"].items():
+        validate(proposal["evidence"], name)
+
+
+def _parse(raw: str, *, segments: list[dict] | None = None) -> dict:
     text = raw.strip()
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL)
     if fence:
@@ -194,6 +321,8 @@ def _parse(raw: str) -> dict:
         details = "; ".join(f"{'.'.join(map(str, e.path)) or '$'}: {e.message}" for e in errors[:8])
         raise LLMError(f"Insight schema validation failed: {details}")
     _validate_commercial_proposal(data)
+    if segments is not None:
+        _validate_evidence_references(data, segments)
     return data
 
 
@@ -213,7 +342,27 @@ def _gigachat_token() -> str:
     return _token
 
 
-def summarize(transcript: str) -> dict:
+def _require_local_browser_agent_gigachat(source_kind: str) -> None:
+    """Fail closed before any network transport for a local-agent transcript."""
+
+    if source_kind != "local_browser_agent":
+        return
+    if not isinstance(LLM_PROVIDER, str) or LLM_PROVIDER.strip().lower() != "gigachat":
+        raise LLMError("local_browser_agent analysis requires LLM_PROVIDER=gigachat")
+    if not isinstance(GIGACHAT_AUTH_KEY, str) or not GIGACHAT_AUTH_KEY.strip():
+        raise LLMError("local_browser_agent analysis requires GIGACHAT_AUTH_KEY")
+
+
+def summarize(transcript: str, segments: list[dict], *, source_kind: str = "legacy") -> dict:
+    """Generate one validated insight.
+
+    ``transcript`` remains an argument for compatibility with the legacy
+    worker call path, but is deliberately never sent to a model.  The stored
+    timeline is the only analysis input.
+    """
+
+    _require_local_browser_agent_gigachat(source_kind)
+    analysis_input = build_analysis_input(segments)
     try:
         if LLM_PROVIDER == "gigachat":
             response = httpx.post(
@@ -221,7 +370,7 @@ def summarize(transcript: str) -> dict:
                 headers={"Authorization": f"Bearer {_gigachat_token()}"},
                 json={"model": GIGACHAT_MODEL, "max_tokens": 1800,
                       "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                                   {"role": "user", "content": transcript}]},
+                                   {"role": "user", "content": analysis_input}]},
                 verify=GIGACHAT_CA_BUNDLE, timeout=90,
             )
             response.raise_for_status()
@@ -232,7 +381,7 @@ def summarize(transcript: str) -> dict:
                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
                 json={"model": OPENAI_MODEL, "max_tokens": 1800, "response_format": {"type": "json_object"},
                       "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                                   {"role": "user", "content": transcript}]},
+                                   {"role": "user", "content": analysis_input}]},
                 timeout=90,
             )
             response.raise_for_status()
@@ -241,11 +390,11 @@ def summarize(transcript: str) -> dict:
             response = httpx.post(
                 f"{OLLAMA_URL}/api/generate",
                 json={"model": OLLAMA_MODEL, "stream": False,
-                      "format": INSIGHT_SCHEMA, "prompt": f"{SYSTEM_PROMPT}\n\n{transcript}"},
+                      "format": INSIGHT_SCHEMA, "prompt": f"{SYSTEM_PROMPT}\n\n{analysis_input}"},
                 timeout=240,
             )
             response.raise_for_status()
             raw = response.json()["response"]
     except (httpx.HTTPError, KeyError, ValueError) as exc:
         raise LLMError(str(exc)) from exc
-    return _parse(raw)
+    return _parse(raw, segments=segments)

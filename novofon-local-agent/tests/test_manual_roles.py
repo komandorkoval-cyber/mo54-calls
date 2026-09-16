@@ -7,6 +7,7 @@ from pathlib import Path
 
 from mo54_agent.cli import _apply_manual_pilot_roles
 from mo54_agent.errors import AgentError
+from mo54_agent.review import automatic_baseline_path
 
 
 class ManualRoleAssignmentTests(unittest.TestCase):
@@ -40,6 +41,8 @@ class ManualRoleAssignmentTests(unittest.TestCase):
         self.assertEqual([segment["role"] for segment in raw["segments"]], ["manager", "manager", "customer"])
         self.assertEqual(raw["manual_role_assignment"]["method"], "operator_confirmation")
         self.assertEqual(raw["manual_role_assignment"]["manager_labels"], ["Спикер 1"])
+        baseline = json.loads(automatic_baseline_path(self.path).read_text(encoding="utf-8"))
+        self.assertEqual([segment["role"] for segment in baseline["segments"]], ["unknown", "unknown", "unknown"])
 
     def test_rejects_unknown_or_conflicting_labels(self) -> None:
         with self.assertRaises(AgentError) as unknown:

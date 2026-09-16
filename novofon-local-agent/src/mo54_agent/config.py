@@ -42,8 +42,13 @@ class AgentPaths:
         )
 
     def ensure(self) -> None:
-        for path in (self.root, self.audio, self.staging, self.transcripts, self.models, self.browser_profile):
+        for path in (self.root, self.audio, self.staging, self.transcripts, self.reviews, self.models, self.browser_profile):
             path.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def reviews(self) -> Path:
+        """Local-only approved-review artifacts, separate from ASR output."""
+        return self.transcripts / "reviews"
 
 
 @dataclass(frozen=True)
@@ -103,6 +108,10 @@ class AgentConfig:
         # Windows PowerShell 5 writes a BOM for Set-Content -Encoding utf8.
         # Accept it so setup.ps1-created configuration works on home PCs.
         raw = json.loads(paths.config.read_text(encoding="utf-8-sig"))
+        # A short-lived development build exposed this setting.  Ignore it on
+        # read rather than letting an old local file reintroduce a delivery
+        # bypass or make the hardened agent fail to start.
+        raw.pop("require_review_before_delivery", None)
         selectors = Selectors(**raw.pop("selectors", {}))
         config = cls(selectors=selectors, **raw)
         config.validate()
