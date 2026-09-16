@@ -3,8 +3,10 @@ import unittest
 from unittest.mock import patch
 
 from llm import (
+    GIGACHAT_FUNCTION_SYSTEM_PROMPT,
     GIGACHAT_LEGACY_INSIGHT_FUNCTION_SCHEMA,
     GIGACHAT_INSIGHT_FUNCTION_NAME,
+    GIGACHAT_TRANSPORT_ENUM_VALUES,
     GIGACHAT_TRANSPORT_REQUIRED_FIELDS,
     INSIGHT_SCHEMA,
     LLMError,
@@ -320,6 +322,10 @@ class InsightValidationTest(unittest.TestCase):
         self.assertEqual(parameters["required"], list(GIGACHAT_TRANSPORT_REQUIRED_FIELDS))
         self.assertEqual(set(parameters["properties"]), set(GIGACHAT_TRANSPORT_REQUIRED_FIELDS))
         self.assertEqual(parameters["properties"]["summary"], {"type": "string"})
+        self.assertEqual(parameters["properties"]["lead_stage"], {
+            "type": "string",
+            "enum": ["", *GIGACHAT_TRANSPORT_ENUM_VALUES["lead_stage"]],
+        })
         self.assertEqual(parameters["properties"]["confidence"], {"type": "number"})
         self.assertEqual(parameters["properties"]["evidence"], {
             "type": "array",
@@ -341,6 +347,69 @@ class InsightValidationTest(unittest.TestCase):
         self.assertNotIn("response_format", request)
         payload = json.loads(request["messages"][1]["content"])
         self.assertEqual(set(payload), {"segments"})
+
+    def test_gigachat_function_prompt_requires_russian_text_and_exact_enum_tokens(self):
+        self.assertIn("human-readable analysis text and list entries in Russian", GIGACHAT_FUNCTION_SYSTEM_PROMPT)
+        self.assertIn("preserve it verbatim", GIGACHAT_FUNCTION_SYSTEM_PROMPT)
+        self.assertIn("exact lowercase token", GIGACHAT_FUNCTION_SYSTEM_PROMPT)
+        self.assertIn("empty string", GIGACHAT_FUNCTION_SYSTEM_PROMPT)
+        for name, values in GIGACHAT_TRANSPORT_ENUM_VALUES.items():
+            with self.subTest(name=name):
+                self.assertIn(f"`{name}`: {', '.join(values)}", GIGACHAT_FUNCTION_SYSTEM_PROMPT)
+
+    def test_gigachat_transport_normalizes_case_and_edge_whitespace_for_persisted_enums(self):
+        transport = json.loads(json.dumps(TRANSPORT_VALID))
+        transport.update({
+            "lead_stage": "  QUALIFIED\t",
+            "lead_temperature": "\nWARM  ",
+            "next_step_owner": " Customer ",
+            "loss_risk": "\tLOW\n",
+            "outcome": "  PROPOSAL_NEEDED ",
+        })
+
+        canonical = _canonicalize_gigachat_transport_arguments(transport, SEGMENTS)
+        parsed = _parse(json.dumps(canonical), segments=SEGMENTS)
+
+        self.assertEqual({
+            name: canonical[name]
+            for name in GIGACHAT_TRANSPORT_ENUM_VALUES
+        }, {
+            "lead_stage": "qualified",
+            "lead_temperature": "warm",
+            "next_step_owner": "customer",
+            "loss_risk": "low",
+            "outcome": "proposal_needed",
+        })
+        self.assertEqual({
+            name: parsed[name]
+            for name in GIGACHAT_TRANSPORT_ENUM_VALUES
+        }, {
+            "lead_stage": "qualified",
+            "lead_temperature": "warm",
+            "next_step_owner": "customer",
+            "loss_risk": "low",
+            "outcome": "proposal_needed",
+        })
+
+    def test_gigachat_transport_drops_natural_language_enum_labels(self):
+        transport = json.loads(json.dumps(TRANSPORT_VALID))
+        rejected_values = {
+            "lead_stage": "Payment Arrangement Confirmed",
+            "lead_temperature": "Very Warm",
+            "next_step_owner": "Customer Success Team",
+            "loss_risk": "Low business risk",
+            "outcome": "Payment Arrangement Confirmed",
+        }
+        transport.update(rejected_values)
+
+        canonical = _canonicalize_gigachat_transport_arguments(transport, SEGMENTS)
+        parsed = _parse(json.dumps(canonical), segments=SEGMENTS)
+
+        for name, raw_value in rejected_values.items():
+            with self.subTest(name=name):
+                self.assertIsNone(canonical[name])
+                self.assertIsNone(parsed[name])
+                self.assertNotIn(raw_value, json.dumps(parsed))
 
     def test_gigachat_normalizes_string_function_arguments(self):
         class Response:

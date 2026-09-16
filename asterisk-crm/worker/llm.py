@@ -38,7 +38,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
-PROMPT_VERSION = "sales-v1.7-legacy-function-transport"
+PROMPT_VERSION = "sales-v1.8-legacy-function-transport-enums"
 MODEL_NAME = {"gigachat": GIGACHAT_MODEL, "openai": OPENAI_MODEL, "ollama": OLLAMA_MODEL}.get(LLM_PROVIDER, LLM_PROVIDER)
 _token, _token_expiry = "", 0.0
 
@@ -190,6 +190,29 @@ GIGACHAT_TRANSPORT_STRING_FIELDS = (
     "loss_risk",
     "outcome",
 )
+GIGACHAT_TRANSPORT_ENUM_FIELDS = (
+    "lead_stage",
+    "lead_temperature",
+    "next_step_owner",
+    "loss_risk",
+    "outcome",
+)
+# Keep this list derived from the persisted schema so a change to an allowed
+# CRM value cannot silently make the compact GigaChat transport disagree with
+# its final local validator. ``None`` remains a persistence-only unknown; the
+# legacy function transport represents it as an empty string.
+GIGACHAT_TRANSPORT_ENUM_VALUES = {
+    name: tuple(
+        value
+        for value in INSIGHT_SCHEMA["properties"][name]["enum"]
+        if isinstance(value, str)
+    )
+    for name in GIGACHAT_TRANSPORT_ENUM_FIELDS
+}
+GIGACHAT_TRANSPORT_ENUM_REQUIREMENTS = "\n".join(
+    f"- `{name}`: {', '.join(values)}"
+    for name, values in GIGACHAT_TRANSPORT_ENUM_VALUES.items()
+)
 GIGACHAT_TRANSPORT_ARRAY_FIELDS = (
     "objections",
     "manager_responses",
@@ -212,6 +235,10 @@ GIGACHAT_LEGACY_INSIGHT_FUNCTION_SCHEMA = {
     "type": "object",
     "properties": {
         **{name: {"type": "string"} for name in GIGACHAT_TRANSPORT_STRING_FIELDS},
+        **{
+            name: {"type": "string", "enum": ["", *GIGACHAT_TRANSPORT_ENUM_VALUES[name]]}
+            for name in GIGACHAT_TRANSPORT_ENUM_FIELDS
+        },
         **{
             name: {"type": "array", "items": {"type": "string"}}
             for name in GIGACHAT_TRANSPORT_ARRAY_FIELDS
@@ -305,6 +332,14 @@ answer in `content`. Supply every required transport key and add no extra keys.
 In this function contract, an exactly empty string means unknown for every string field. Do not
 use null for those fields and do not use numeric 0 to mean unknown. Use [] for an unknown list.
 `confidence` must be a real number from 0 to 1.
+
+Write all human-readable analysis text and list entries in Russian. An evidence `quote` is the
+only exception: preserve it verbatim in the transcript's original language; never translate it.
+
+For these enum fields, return only the exact lowercase token shown below, or an empty string when
+the transcript does not support one. Do not translate, explain, or substitute a natural-language
+label:
+{GIGACHAT_TRANSPORT_ENUM_REQUIREMENTS}
 
 Each `evidence` item must contain only `field`, `segment_ordinal`, and `quote`. The ordinal must
 identify one input segment exactly, and quote must be an exact case-sensitive substring of that
@@ -630,6 +665,22 @@ def _validate_gigachat_transport_arguments(arguments: object) -> dict:
     return arguments
 
 
+def _canonicalize_gigachat_transport_enum(name: str, value: str) -> str | None:
+    """Keep only a persisted enum token after harmless case/edge-space cleanup.
+
+    The legacy model has returned natural-language labels for these values.
+    This deliberately does not map aliases, translations, spaces to
+    underscores, or similar-looking phrases to a CRM enum: an unsupported
+    value is unknown, rather than an inferred business state.
+    """
+
+    allowed_values = GIGACHAT_TRANSPORT_ENUM_VALUES.get(name)
+    if allowed_values is None:
+        raise LLMError(f"GigaChat transport field is not an enum: {name}")
+    normalized = value.strip().lower()
+    return normalized if normalized in allowed_values else None
+
+
 def _canonicalize_gigachat_transport_arguments(arguments: object, segments: list[dict]) -> dict:
     """Expand safe transport arguments into the complete persisted insight.
 
@@ -660,7 +711,11 @@ def _canonicalize_gigachat_transport_arguments(arguments: object, segments: list
         })
 
     result = {
-        name: None if arguments[name] == "" else arguments[name]
+        name: (
+            _canonicalize_gigachat_transport_enum(name, arguments[name])
+            if name in GIGACHAT_TRANSPORT_ENUM_FIELDS
+            else None if arguments[name] == "" else arguments[name]
+        )
         for name in GIGACHAT_TRANSPORT_STRING_FIELDS
     }
     result.update({
