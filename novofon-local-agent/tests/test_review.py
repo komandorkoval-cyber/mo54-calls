@@ -26,6 +26,7 @@ from mo54_agent.review import (
     _ReviewContext,
     _ReviewHTTPServer,
     _default_review_text,
+    _review_speech_bounds,
 )
 from mo54_agent.store import AgentStore, CallRecord
 
@@ -135,6 +136,58 @@ class PilotReviewTests(unittest.TestCase):
                 language="ru",
             )
         self.assertEqual(overflow.exception.code, "pilot_review_timing_out_of_bounds")
+
+    def test_keyboard_editor_boundary_round_trips_through_local_approval(self) -> None:
+        """The simplified editor still saves only real, ordered playhead boundaries."""
+        context = _ReviewContext(self.paths, self.record, "local draft", 0, 3000)
+        server = _ReviewHTTPServer(("127.0.0.1", 0), context)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            payload = json.dumps({
+                "tagged_text": "[Клиент]: Здравствуйте\n[я]: Алло",
+                "timings": [
+                    {"started_ms": 0, "ended_ms": 1250},
+                    {"started_ms": 1250, "ended_ms": 3000},
+                ],
+            }, ensure_ascii=False).encode("utf-8")
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            connection.request(
+                "POST",
+                "/approve",
+                body=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Origin": f"http://127.0.0.1:{server.server_port}",
+                },
+            )
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            response.read()
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+            transcript = load_approved_review(self.paths, self.record)
+            self.assertEqual([segment.role for segment in transcript.segments], ["customer", "manager"])
+            self.assertEqual(
+                [(segment.started_ms, segment.ended_ms) for segment in transcript.segments],
+                [(0, 1250), (1250, 3000)],
+            )
+        finally:
+            if thread.is_alive():
+                server.shutdown()
+                thread.join(timeout=5)
+            server.server_close()
+
+    def test_keyboard_editor_uses_neutral_draft_and_observed_speech_envelope(self) -> None:
+        automatic = build_reviewed_transcript(
+            "[я]: Алло\n[Клиент]: Здравствуйте",
+            [{"started_ms": 500, "ended_ms": 900}, {"started_ms": 1100, "ended_ms": 2500}],
+            audio_duration_sec=3,
+            asr_model="test",
+            language="ru",
+        )
+        self.assertEqual(_default_review_text(automatic), "Алло Здравствуйте")
+        self.assertEqual(_review_speech_bounds(automatic, 3), (500, 2500))
 
     def test_approved_review_keeps_auto_source_separate_and_verifiable(self) -> None:
         artifact = create_approved_review(
@@ -262,7 +315,11 @@ class PilotReviewTests(unittest.TestCase):
             page = response.read().decode("utf-8")
             self.assertEqual(response.status, 200)
             self.assertIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy"))
-            self.assertIn("Взять с плеера", page)
+            self.assertIn('data-testid="first-speaker"', page)
+            self.assertIn("splitTurnAtPlayhead", page)
+            self.assertIn("Shift+Enter", page)
+            self.assertNotIn("Взять с плеера", page)
+            self.assertNotIn("name='started_ms'", page)
 
             connection.request("POST", "/cancel", headers={"Origin": "https://untrusted.example"})
             rejected = connection.getresponse()
