@@ -131,6 +131,31 @@ class FrontendDeliveryTests(unittest.TestCase):
                 third = self.module.render_frontend_index()
                 self.assertNotEqual(first_styles_url, self.asset_url(third, "styles.css")[0])
 
+    def test_local_review_link_is_constrained_to_a_safe_novofon_call(self):
+        source = (API / "static" / "app.js").read_text(encoding="utf-8")
+        match = re.search(
+            r"const LOCAL_REVIEW_SESSION_ID = .*?;\n\n"
+            r"function localReviewLaunch\(call\) \{(?P<body>.*?)\n\}\n\n"
+            r"function recordingPanel",
+            source,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        body = match.group("body")
+
+        self.assertIn("!isNovofon(call)", body)
+        self.assertIn("call?.transcript", body)
+        self.assertIn("LOCAL_REVIEW_SESSION_ID.test(sessionId)", body)
+        self.assertIn("mo54-calls-review://review/${encodeURIComponent(sessionId)}", body)
+        self.assertIn('target="_blank" rel="noopener" referrerpolicy="no-referrer"', body)
+        self.assertIn('href="${esc(href)}"', body)
+        self.assertIn("Открыть локальную проверку", body)
+        self.assertIn("Текст отправится в CRM только после локального подтверждения", body)
+        self.assertNotIn("api(", body)
+        self.assertNotIn("fetch(", body)
+        self.assertIn("const reviewLaunch = localReviewLaunch(call);", source)
+        self.assertIn("${reviewLaunch}", source)
+
 
 if __name__ == "__main__":
     unittest.main()

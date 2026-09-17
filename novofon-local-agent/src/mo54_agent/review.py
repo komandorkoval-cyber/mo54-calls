@@ -12,7 +12,7 @@ from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from .asr import Transcript, TranscriptSegment
 from .errors import AgentError
@@ -29,7 +29,10 @@ REVIEW_SEAL_KEY_ID = "windows-credential-manager-v1"
 MAX_REVIEW_REQUEST_BYTES = 2 * 1024 * 1024
 TIMING_MODE_MANUAL = "manual_audio_boundary"
 TIMING_MODE_TEXT_ONLY = "text_only"
+REVIEW_URI_SCHEME = "mo54-calls-review"
+REVIEW_URI_HOST = "review"
 _TAGGED_TURN = re.compile(r"^\s*\[(?P<label>[^\]]+)\]\s*:\s*(?P<text>.*?)\s*$")
+_SAFE_REVIEW_SESSION_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
 _ROLE_FOR_LABEL = {"я": "manager", "клиент": "customer"}
 _DISPLAY_LABEL_FOR_ROLE = {"manager": "я", "customer": "Клиент"}
 
@@ -39,6 +42,39 @@ class ReviewTurn:
     role: str
     label: str
     text: str
+
+
+def parse_review_uri(uri: str) -> str:
+    """Extract one exact local call ID from the registered Windows URI.
+
+    The URL is untrusted browser input. It deliberately carries only a stable
+    provider session ID, never a recording URL, browser data, or a CRM
+    credential. Keep the accepted shape narrow so a custom-protocol handler
+    cannot be repurposed into an arbitrary command launcher.
+    """
+
+    if not isinstance(uri, str) or not uri or uri != uri.strip():
+        raise AgentError("review_uri_invalid", "The local review link is invalid", retryable=False)
+    parsed = urlparse(uri)
+    if (
+        parsed.scheme != REVIEW_URI_SCHEME
+        or parsed.netloc != REVIEW_URI_HOST
+        or not parsed.path.startswith("/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise AgentError("review_uri_invalid", "The local review link is invalid", retryable=False)
+    # One path component only. Decode once so a normal browser-escaped colon
+    # remains usable, but a double-encoded slash is still rejected by the safe
+    # identifier expression below.
+    raw_session_id = parsed.path[1:]
+    try:
+        call_session_id = unquote(raw_session_id, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise AgentError("review_uri_invalid", "The local review link is invalid", retryable=False) from exc
+    if not _SAFE_REVIEW_SESSION_ID.fullmatch(call_session_id):
+        raise AgentError("review_uri_invalid", "The local review link is invalid", retryable=False)
+    return call_session_id
 
 
 def automatic_baseline_path(transcript_path: Path) -> Path:

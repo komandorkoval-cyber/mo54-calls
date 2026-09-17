@@ -15,7 +15,8 @@ from .browser import NovofonBrowser
 from .config import AgentConfig, AgentPaths
 from .crm import CRMClient
 from .errors import AgentError
-from .review import load_approved_review, preserve_automatic_baseline, review_pilot
+from .review import load_approved_review, parse_review_uri, preserve_automatic_baseline, review_artifact_path, review_pilot
+from .review_protocol import install_review_uri_handler
 from .runner import AgentRunner
 from .security import set_crm_token
 from .store import AgentLock, AgentStore
@@ -97,6 +98,150 @@ def _install_task(paths: AgentPaths) -> None:
     # schtasks cannot consistently set WakeToRun; setup.ps1 uses the full ScheduledTasks API.
 
 
+def _deliver_verified_pilot_review(
+    paths: AgentPaths,
+    config: AgentConfig,
+    store: AgentStore,
+    call_session_id: str,
+) -> tuple[bool, bool | None]:
+    """Deliver exactly the verified-review path used by ``deliver-pilot``.
+
+    This helper deliberately has no download, ASR, or browser operation.  It
+    opens the CRM client only after the caller has explicitly requested a
+    delivery of an already approved local review.
+    """
+
+    record = store.get(call_session_id)
+    if not record:
+        raise AgentError("pilot_call_not_deliverable", "The selected pilot call is not ready for CRM delivery", retryable=False)
+    if record.status == "sent":
+        # A confirmed first delivery makes the approved review immutable.  Do
+        # not let a custom protocol invocation create a hidden second version.
+        load_approved_review(paths, record)
+        return False, None
+    if record.status != "transcribed":
+        raise AgentError("pilot_call_not_deliverable", "The selected pilot call is not ready for CRM delivery", retryable=False)
+    if not record.audio_sha256 or not record.audio_duration_sec or not record.transcript_path:
+        raise AgentError("pilot_transcript_missing", "The pilot transcript metadata is incomplete", retryable=False)
+    if not AgentRunner.duration_within_inventory_tolerance(record.duration_sec, record.audio_duration_sec):
+        raise AgentError("pilot_duration_mismatch", "Downloaded audio duration needs manual review before CRM delivery", retryable=False)
+    transcript = load_approved_review(paths, record)
+    # CRMClient receives the metadata object only. Its path is never opened or
+    # uploaded; the endpoint contract contains text only.
+    from .browser import DownloadedAudio
+
+    response = CRMClient(config).send_transcript(
+        record.call_session_id,
+        DownloadedAudio(record.audio_path or paths.audio / "local-only", record.audio_sha256, record.audio_duration_sec),
+        transcript,
+    )
+    store.mark_sent(record.call_session_id)
+    return True, bool(response.get("idempotent"))
+
+
+def _confirm_approved_delivery() -> bool:
+    """Ask locally before a deep link can contact CRM.
+
+    A browser URI handler has no trustworthy web origin to inspect.  Native
+    confirmation makes the final, outbound action visible to the Windows user
+    even if another page attempts to launch the registered protocol.
+    """
+
+    if sys.platform != "win32":
+        raise AgentError(
+            "review_delivery_confirmation_unavailable",
+            "Local delivery confirmation is available only on Windows",
+            retryable=False,
+        )
+    try:
+        import ctypes
+
+        result = ctypes.windll.user32.MessageBoxW(
+            None,
+            "Отправить утверждённый текст в MO54 Calls CRM?\n\n"
+            "Будут отправлены только текст, роли и служебные хэши. "
+            "Аудио, ссылка записи Novofon, cookie и пароль останутся на этом ПК.",
+            "MO54 Calls — локальный агент",
+            0x00000004 | 0x00000020 | 0x00010000,  # Yes/No, question, foreground
+        )
+    except (AttributeError, OSError) as exc:
+        raise AgentError(
+            "review_delivery_confirmation_unavailable",
+            "Could not show the local delivery confirmation",
+            retryable=False,
+        ) from exc
+    return result == 6  # IDYES
+
+
+def _show_review_uri_error(message: str) -> None:
+    """Make custom-protocol failures readable when the console closes."""
+
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            message,
+            "MO54 Calls — локальный агент",
+            0x00000000 | 0x00000010 | 0x00010000,  # OK, error, foreground
+        )
+    except (AttributeError, OSError):
+        # The safe error code emitted by ``main`` remains available to a
+        # manually launched console even when the native dialog is unavailable.
+        return
+
+
+def _review_from_uri(paths: AgentPaths, config: AgentConfig, store: AgentStore, uri: str) -> None:
+    """Open or deliver one locally prepared review from a Windows deep link."""
+
+    call_session_id = parse_review_uri(uri)
+    with AgentLock(paths.lock):
+        record = store.get(call_session_id)
+        if not record or record.status != "transcribed":
+            raise AgentError(
+                "review_uri_not_ready",
+                "Этот звонок ещё не подготовлен на этом ПК. Сначала локально скачайте и расшифруйте его.",
+                retryable=False,
+            )
+
+        # If the previous operator approval was deliberately not delivered,
+        # validate it again and offer only the explicit delivery confirmation.
+        # ``review_pilot`` itself rejects a second editing session for a sealed
+        # artifact, which preserves the pilot's one-version rule.
+        if review_artifact_path(paths, call_session_id).is_file():
+            load_approved_review(paths, record)
+        else:
+            review_pilot(
+                paths,
+                record,
+                on_started=lambda url: print(json.dumps({
+                    "call_session_id": call_session_id,
+                    "review_url": url,
+                    "bound_to_loopback": True,
+                    "crm_contacted": False,
+                }, ensure_ascii=False), flush=True),
+            )
+
+        if not _confirm_approved_delivery():
+            print(json.dumps({
+                "call_session_id": call_session_id,
+                "review_approved": True,
+                "delivery_deferred": True,
+                "crm_contacted": False,
+            }, ensure_ascii=False))
+            return
+
+        delivered, idempotent = _deliver_verified_pilot_review(paths, config, store, call_session_id)
+        print(json.dumps({
+            "call_session_id": call_session_id,
+            "delivered": int(delivered),
+            "already_delivered": not delivered,
+            "crm_idempotent": idempotent,
+        }, ensure_ascii=False))
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="mo54-agent")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -121,14 +266,28 @@ def main(argv: list[str] | None = None) -> None:
     assign_roles.add_argument("--customer-label", action="append", default=[])
     review_pilot_command = subcommands.add_parser("review-pilot")
     review_pilot_command.add_argument("call_session_id")
+    review_uri = subcommands.add_parser("review-uri")
+    review_uri.add_argument("uri")
     deliver_pilot = subcommands.add_parser("deliver-pilot")
     deliver_pilot.add_argument("call_session_id")
+    subcommands.add_parser("install-review-uri")
     subcommands.add_parser("exclude-pending-downloads")
     subcommands.add_parser("status")
     subcommands.add_parser("install-task")
     subcommands.add_parser("set-crm-token")
     args = parser.parse_args(argv)
     try:
+        # This narrow maintenance command intentionally avoids ``_components``
+        # so it cannot create or enable the scheduled worker, touch Playwright
+        # data, prepare models, or contact CRM.
+        if args.command == "install-review-uri":
+            executable = install_review_uri_handler()
+            print(json.dumps({
+                "review_uri_handler_installed": True,
+                "agent_executable": executable.name,
+                "crm_contacted": False,
+            }, ensure_ascii=False))
+            return
         paths, config, store = _components()
         if args.command == "preflight":
             asr = LocalASR(paths, config)
@@ -248,35 +407,15 @@ def main(argv: list[str] | None = None) -> None:
                     "review_artifact": artifact.name,
                     "crm_contacted": False,
                 }, ensure_ascii=False))
+        elif args.command == "review-uri":
+            _review_from_uri(paths, config, store, args.uri)
         elif args.command == "deliver-pilot":
             with AgentLock(paths.lock):
-                record = store.get(args.call_session_id)
-                if not record:
-                    raise AgentError("pilot_call_not_deliverable", "The selected pilot call is not ready for CRM delivery", retryable=False)
-                if record.status == "sent":
-                    # The first confirmed delivery makes this approved review
-                    # immutable.  A local rerun therefore cannot create a
-                    # hidden second transcript version.
-                    load_approved_review(paths, record)
+                delivered, idempotent = _deliver_verified_pilot_review(paths, config, store, args.call_session_id)
+                if not delivered:
                     print(json.dumps({"delivered": 0, "already_delivered": True}, ensure_ascii=False))
                     return
-                if record.status != "transcribed":
-                    raise AgentError("pilot_call_not_deliverable", "The selected pilot call is not ready for CRM delivery", retryable=False)
-                if not record.audio_sha256 or not record.audio_duration_sec or not record.transcript_path:
-                    raise AgentError("pilot_transcript_missing", "The pilot transcript metadata is incomplete", retryable=False)
-                if not AgentRunner.duration_within_inventory_tolerance(record.duration_sec, record.audio_duration_sec):
-                    raise AgentError("pilot_duration_mismatch", "Downloaded audio duration needs manual review before CRM delivery", retryable=False)
-                transcript = load_approved_review(paths, record)
-                # CRMClient receives the metadata object only.  Its path is never
-                # opened or uploaded; the endpoint contract contains text only.
-                from .browser import DownloadedAudio
-                response = CRMClient(config).send_transcript(
-                    record.call_session_id,
-                    DownloadedAudio(record.audio_path or paths.audio / "local-only", record.audio_sha256, record.audio_duration_sec),
-                    transcript,
-                )
-                store.mark_sent(record.call_session_id)
-                print(json.dumps({"delivered": 1, "crm_idempotent": bool(response.get("idempotent"))}, ensure_ascii=False))
+                print(json.dumps({"delivered": 1, "crm_idempotent": idempotent}, ensure_ascii=False))
         elif args.command == "exclude-pending-downloads":
             with AgentLock(paths.lock):
                 print(json.dumps({"excluded": store.block_pending_downloads("excluded_before_schedule")}, ensure_ascii=False))
@@ -287,6 +426,8 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "set-crm-token":
             set_crm_token(getpass.getpass("CRM local-agent token: "))
     except AgentError as exc:
+        if args.command == "review-uri":
+            _show_review_uri_error(str(exc))
         print(json.dumps({"error": exc.code}, ensure_ascii=False), file=sys.stderr)
         raise SystemExit(2) from exc
 

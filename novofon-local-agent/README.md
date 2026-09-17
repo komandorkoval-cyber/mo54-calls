@@ -60,8 +60,47 @@ API-контейнер с обновлённым окружением. Сам а
 `preflight`, `provision-browser`, `inspect-layout`, `inventory`, `enroll-manager PATH`,
 `download-pilot CALL_SESSION_ID`, `transcribe-pilot CALL_SESSION_ID`,
 `assign-pilot-roles CALL_SESSION_ID --manager-label "Спикер 1"`,
-`review-pilot CALL_SESSION_ID`, `deliver-pilot CALL_SESSION_ID`, `run-once`, `status`, `install-task`,
+`review-pilot CALL_SESSION_ID`, `review-uri URI`, `deliver-pilot CALL_SESSION_ID`, `run-once`, `status`, `install-task`,
+`install-review-uri`,
 `set-crm-token`.
+
+## One-click review from a MO54 Calls card
+
+After running `setup.ps1`, Windows registers the per-user URI handler
+`mo54-calls-review://`. A button in a Novofon call card can open a URI in the
+following exact form:
+
+```text
+mo54-calls-review://review/CALL_SESSION_ID
+```
+
+The card passes only `CALL_SESSION_ID`; it does not pass audio, a Novofon URL,
+cookies, passwords, or a CRM token. The local agent validates the URI, finds
+the exact call only in its local SQLite store, and opens the loopback editor
+only when the call is already locally `transcribed`. It never starts a
+download, ASR, browser session, or CRM request from the link itself.
+
+When the local review is approved, Windows explicitly asks whether to send the
+approved text to MO54 Calls. Choosing **No** keeps the sealed review only on
+this PC; the next click validates that same review and offers delivery again.
+Choosing **Yes** uses the same verified path as `deliver-pilot`: only approved
+text, roles, hashes, and metadata are sent. Audio and browser data stay local.
+
+If the browser says that no application can open the link, run only
+`install-review-uri` for the current Windows user and then click the card
+button again. If the agent reports that the call is not ready, prepare that
+exact call locally first; the deep link deliberately does not download or
+transcribe it on its own.
+
+For an existing installation, update only this Windows association with:
+
+```powershell
+& "$env:LOCALAPPDATA\MO54CallsAgent\venv\Scripts\mo54-agent.exe" install-review-uri
+```
+
+This command writes only the current user's `HKCU` protocol handler. It does
+not install, enable, or run `MO54CallsAgent`; the 30-minute task remains under
+its existing explicit controls.
 
 Для приёмки одного звонка сначала вручную войдите в выделенный профиль Edge,
 запустите `inspect-layout` и `inventory`, а затем выберите один свежий

@@ -505,6 +505,15 @@ function localRecordings(call) {
   return asArray(call.recordings).filter(recording => !providerRecordings(call).some(provider => String(provider.id || provider.recording_id) === String(recording.id || recording.recording_id)));
 }
 
+const LOCAL_REVIEW_SESSION_ID = /^[A-Za-z0-9_.:-]{1,200}$/;
+
+function localReviewLaunch(call) {
+  const sessionId = String(call?.external_call_id || '');
+  if (!isNovofon(call) || call?.transcript || !LOCAL_REVIEW_SESSION_ID.test(sessionId)) return '';
+  const href = `mo54-calls-review://review/${encodeURIComponent(sessionId)}`;
+  return `<a class="provider-recording-link" href="${esc(href)}" target="_blank" rel="noopener" referrerpolicy="no-referrer">Открыть локальную проверку</a><p class="muted">Аудио остаётся на этом ПК. Текст отправится в CRM только после локального подтверждения. Если проверка не открылась, звонок ещё не подготовлен локально.</p>`;
+}
+
 function recordingPanel(call) {
   const provider = providerRecordings(call);
   const local = localRecordings(call);
@@ -522,7 +531,8 @@ function recordingPanel(call) {
       if (!id) return '';
       return `<a class="provider-recording-link" href="/api/recordings/${encodeURIComponent(id)}/open" target="_blank" rel="noopener noreferrer">Открыть запись в Novofon</a>`;
     }).join('');
-    parts.push(`<div class="provider-recording"><div><small>ЗАПИСЬ NOVOFON</small><b>${esc(stateText)}</b><p>Файл хранится у Novofon. В CRM не показывается и не передаётся его внешняя ссылка.</p></div><div class="provider-recording-actions">${links || '<span class="muted">Ссылка появится после уведомления от Novofon.</span>'}</div></div>`);
+    const reviewLaunch = localReviewLaunch(call);
+    parts.push(`<div class="provider-recording"><div><small>ЗАПИСЬ NOVOFON</small><b>${esc(stateText)}</b><p>Файл хранится у Novofon. В CRM не показывается и не передаётся его внешняя ссылка.</p></div><div class="provider-recording-actions">${links || '<span class="muted">Ссылка появится после уведомления от Novofon.</span>'}${reviewLaunch}</div></div>`);
   }
 
   return parts.join('');

@@ -52,6 +52,19 @@ if ($BrowserOnly) {
 }
 & $venvPython -m playwright install msedge
 
+$agentExe = Join-Path $venv 'Scripts\mo54-agent.exe'
+if (-not (Test-Path -LiteralPath $agentExe)) {
+    throw "Local agent executable was not installed: $agentExe"
+}
+
+# Register a user-scoped URI handler through the narrow agent command.  It
+# touches only HKCU protocol registration; it does not create or enable the
+# 30-minute scheduled task.
+& $agentExe install-review-uri
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not register mo54-calls-review:// for local transcript review.'
+}
+
 if (-not $SkipFfmpegInstall -and -not (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue)) {
     if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
         winget install --id Gyan.FFmpeg.Shared --exact --accept-source-agreements --accept-package-agreements
@@ -69,7 +82,6 @@ if (-not (Test-Path $configPath)) {
 }
 
 if (-not $SkipScheduledTask) {
-    $agentExe = Join-Path $venv 'Scripts\mo54-agent.exe'
     $action = New-ScheduledTaskAction -Execute $agentExe -Argument 'run-once'
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(2)
     $trigger.Repetition.Interval = (New-TimeSpan -Minutes 30)
